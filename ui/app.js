@@ -7,6 +7,17 @@ let dlRows = []; // zips found in Downloads
 let rollbacks = {}; // id -> version a roll back would restore ("" = unknown)
 let adoptGroups = []; // hand-installed addons Hearth could start tracking
 let missingDeps = {}; // id -> [{folder, zip_path, zip_file}]
+let notesOpen = null; // id whose "What's new" is expanded
+const notes = {}; // id -> text | null while loading
+
+function notesRow(a) {
+  const text = notes[a.id];
+  const u = updates[a.id];
+  return `<tr class="link-row"><td colspan="5">
+    <div class="link-find">What's new in ${esc(u?.latest ?? "the latest version")}</div>
+    <pre class="changelog">${text == null ? "Loading…" : esc(text)}</pre>
+  </td></tr>`;
+}
 
 function depWarnings(a) {
   return (missingDeps[a.id] ?? [])
@@ -192,7 +203,8 @@ function render() {
       let latest = '<span class="muted">–</span>';
       if (a.provider === "local") latest = '<span class="muted" title="No online source known. Download a newer zip to update.">manual</span>';
       else if (u?.error) latest = `<span class="bad" title="${esc(u.error)}">error</span>`;
-      else if (u?.has_update) latest = `<span class="new">${esc(u.latest)}</span>`;
+      else if (u?.has_update)
+        latest = `<span class="new">${esc(u.latest)}</span><div><a href="#" class="ext" data-notes="${esc(a.id)}">${notesOpen === a.id ? "Hide" : "What's new"}</a></div>`;
       else if (u) latest = '<span class="muted">up to date</span>';
       const src = sourceLabel(a.provider, a.source);
       return `<tr>
@@ -209,7 +221,7 @@ function render() {
                 rollbacks[a.id] ? `Roll back to ${esc(rollbacks[a.id])}` : "Roll back", "ghost")
             : ""}
           <button class="small danger" data-remove="${esc(a.id)}" ${["up:", "ln:", "rb:"].some((k) => jobs.has(k + a.id)) ? "disabled" : ""}>Remove</button>
-        </td></tr>${linkOpen === a.id ? linkRow(a) : ""}`;
+        </td></tr>${linkOpen === a.id ? linkRow(a) : ""}${notesOpen === a.id ? notesRow(a) : ""}`;
     })
     .join("");
   // Downloads: show what can be installed/updated; just count the rest.
@@ -408,6 +420,8 @@ function enqueueUpdate(id) {
   enqueue("up:" + id, name, async () => {
     const a = await invoke("update_addon", { id });
     delete updates[id];
+    delete notes[id];
+    if (notesOpen === id) notesOpen = null;
     return `${a.name} ${a.version}`;
   });
 }
@@ -464,6 +478,19 @@ $("tracked").onclick = (e) => {
   const rm = e.target.closest("[data-remove]")?.dataset.remove;
   const ln = e.target.closest("[data-link]")?.dataset.link;
   const go = e.target.closest("[data-link-go]")?.dataset.linkGo;
+  const nt = e.target.closest("[data-notes]")?.dataset.notes;
+  if (nt) {
+    e.preventDefault();
+    notesOpen = notesOpen === nt ? null : nt;
+    if (notesOpen && notes[nt] === undefined) {
+      notes[nt] = null;
+      invoke("changelog", { id: nt })
+        .then((t) => (notes[nt] = t))
+        .catch((err) => (notes[nt] = `Couldn't load the release notes: ${err}`))
+        .finally(render);
+    }
+    return render();
+  }
   if (e.target.closest("[data-link-cancel]")) {
     linkOpen = null;
     return render();

@@ -6,9 +6,40 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct Release {
     pub version: String,
     pub download_url: String,
+    /// Release notes, when the source includes them with the release.
+    pub changelog: Option<String>,
+    /// Where to fetch the notes separately (CurseForge), when they aren't included.
+    pub changelog_url: Option<String>,
+}
+
+/// CurseForge changelogs are HTML. Turn them into readable plain text.
+pub fn html_to_text(html: &str) -> String {
+    let breaks = Regex::new(r"(?i)<br\s*/?>|</p>|</li>|</h\d>|</div>").unwrap();
+    let bullets = Regex::new(r"(?i)<li[^>]*>").unwrap();
+    let tags = Regex::new(r"<[^>]+>").unwrap();
+    let blank = Regex::new(r"\n{3,}").unwrap();
+    let s = breaks.replace_all(html, "\n");
+    let s = bullets.replace_all(&s, "• ");
+    let s = tags.replace_all(&s, "");
+    let s = s
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace('\u{feff}', "");
+    blank.replace_all(s.trim(), "\n\n").into_owned()
+}
+
+/// Fetch notes that weren't included with the release (CurseForge's change-log endpoint).
+pub async fn fetch_changelog(client: &reqwest::Client, url: &str) -> Result<String> {
+    let v: Value = client.get(url).send().await?.error_for_status()?.json().await?;
+    Ok(html_to_text(v["changelogBody"].as_str().unwrap_or("")))
 }
 
 pub struct Parsed {
@@ -178,6 +209,8 @@ async fn curse_latest(client: &reqwest::Client, id: &str, pattern: Option<&str>,
     Ok(Release {
         version: f.display_name.clone(),
         download_url: format!("https://www.curseforge.com/api/v1/mods/{id}/files/{}/download", f.id),
+        changelog_url: Some(format!("https://www.curseforge.com/api/v1/mods/{id}/files/{}/change-log", f.id)),
+        ..Default::default()
     })
 }
 
@@ -193,6 +226,8 @@ struct GhRelease {
     #[serde(default)]
     assets: Vec<GhAsset>,
     zipball_url: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +302,8 @@ async fn github_latest(
             return Ok(Release {
                 version: rel.tag_name.clone(),
                 download_url: asset.browser_download_url.clone(),
+                changelog: rel.body.clone(),
+                ..Default::default()
             });
         }
         if asset_pattern.is_some() {
@@ -277,6 +314,8 @@ async fn github_latest(
             return Ok(Release {
                 version: rel.tag_name.clone(),
                 download_url: zb.clone(),
+                changelog: rel.body.clone(),
+                ..Default::default()
             });
         }
     }
@@ -292,6 +331,8 @@ async fn github_latest(
     Ok(Release {
         version: format!("commit {}", &sha[..7.min(sha.len())]),
         download_url: format!("https://api.github.com/repos/{source}/zipball/{sha}"),
+        changelog: commits[0]["commit"]["message"].as_str().map(String::from),
+        ..Default::default()
     })
 }
 
@@ -319,5 +360,6 @@ async fn wowi_latest(client: &reqwest::Client, id: &str) -> Result<Release> {
         .as_str()
         .ok_or_else(|| anyhow!("WoWInterface gave no download link for {id}"))?
         .to_string();
-    Ok(Release { version, download_url })
+    let changelog = item["changeLog"].as_str().map(|s| s.replace("\r\n", "\n"));
+    Ok(Release { version, download_url, changelog, ..Default::default() })
 }

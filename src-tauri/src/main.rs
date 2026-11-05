@@ -524,6 +524,27 @@ async fn restore_settings(ctx: tauri::State<'_, Ctx>, file: String) -> Res<()> {
         .map_err(err)
 }
 
+/// Release notes for the version an update would install.
+#[tauri::command]
+async fn changelog(ctx: tauri::State<'_, Ctx>, id: String) -> Res<String> {
+    let (a, addons_dir, token) = {
+        let st = ctx.state.lock().await;
+        let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
+        (a, st.addons_dir.clone(), st.token().map(String::from))
+    };
+    let game = game::detect(Path::new(&addons_dir));
+    let rel = providers::latest(&ctx.client, token.as_deref(), &a.provider, &a.source, a.asset_pattern.as_deref(), &game)
+        .await
+        .map_err(err)?;
+    let text = match (rel.changelog, rel.changelog_url) {
+        (Some(t), _) => t,
+        (None, Some(url)) => providers::fetch_changelog(&ctx.client, &url).await.map_err(err)?,
+        _ => String::new(),
+    };
+    let text = text.replace("\r\n", "\n");
+    Ok(if text.trim().is_empty() { format!("{} {} has no release notes.", a.name, rel.version) } else { text.trim().to_string() })
+}
+
 /// Is WoW running? null when it can't be checked.
 #[tauri::command]
 async fn wow_running() -> Res<Option<bool>> {
@@ -617,6 +638,7 @@ fn main() {
             rollback_options,
             roll_back,
             wow_running,
+            changelog,
             settings_backups,
             backup_settings_now,
             restore_settings,

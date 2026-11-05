@@ -199,6 +199,23 @@ async fn curseforge_forever_build() {
 }
 
 #[test]
+fn changelog_html_to_text() {
+    let t = providers::html_to_text("<p>\u{feff}1.2 - Today</p>\n<ul>\n<li>Fixed &amp; improved</li><li>New <b>thing</b></li></ul>");
+    assert_eq!(t, "1.2 - Today\n\n• Fixed & improved\n• New thing");
+}
+
+/// Real CurseForge release notes for Leatrix Maps' -forever build.
+#[tokio::test]
+#[ignore]
+async fn curseforge_changelog() {
+    let rel = providers::latest(&client(), None, "curse", "298842", None, &forever()).await.unwrap();
+    let text = providers::fetch_changelog(&client(), rel.changelog_url.as_deref().unwrap()).await.unwrap();
+    println!("{}", &text[..text.len().min(300)]);
+    assert!(!text.contains('<'), "no HTML left");
+    assert!(text.len() > 20);
+}
+
+#[test]
 fn finds_missing_dependencies() {
     let dir = tempfile::tempdir().unwrap();
     let addon = |folder: &str, body: &str| {
