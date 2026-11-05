@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod downloads;
+mod game;
 mod installer;
 mod providers;
 mod state;
@@ -114,14 +115,22 @@ fn old_folders(st: &AppState, id: &str) -> Vec<String> {
     st.addons.iter().find(|a| a.id == id).map(|a| a.folders.clone()).unwrap_or_default()
 }
 
-/// Install/update from an online source. Caller holds the state lock.
-async fn do_install(st: &mut AppState, client: &reqwest::Client, o: Origin) -> anyhow::Result<TrackedAddon> {
+/// Install/update from an online source. `extra_old` = folders of another entry being replaced.
+/// Caller holds the state lock.
+async fn do_install(st: &mut AppState, client: &reqwest::Client, o: Origin, extra_old: &[String]) -> anyhow::Result<TrackedAddon> {
     if o.provider == "local" {
-        anyhow::bail!("Installed from a zip with no online source. Download a newer zip and install it from the Downloads list.");
+        anyhow::bail!("Installed from a zip with no online source. Use Link to connect it to GitHub, WoWInterface or CurseForge.");
     }
     let id = o.id();
-    let rel = providers::latest(client, st.token(), &o.provider, &o.source, o.asset_pattern.as_deref()).await?;
-    let folders = installer::install(client, Path::new(&st.addons_dir), &id, &rel.download_url, &old_folders(st, &id)).await?;
+    let game = game::detect(Path::new(&st.addons_dir));
+    let rel = providers::latest(client, st.token(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
+    let mut old = old_folders(st, &id);
+    for f in extra_old {
+        if !old.iter().any(|o| o.eq_ignore_ascii_case(f)) {
+            old.push(f.clone());
+        }
+    }
+    let folders = installer::install(client, Path::new(&st.addons_dir), &id, &rel.download_url, &old).await?;
     record(st, o, rel.version, folders)
 }
 
@@ -129,9 +138,10 @@ fn tracked_owner<'a>(st: &'a AppState, folder: &str) -> Option<&'a TrackedAddon>
     st.addons.iter().find(|a| a.folders.iter().any(|f| f.eq_ignore_ascii_case(folder)))
 }
 
-/// How a downloaded zip should be tracked: keep existing tracking, else GitHub > WoWInterface > manual.
+/// How a downloaded zip should be tracked: keep existing online tracking,
+/// else GitHub > WoWInterface > CurseForge > manual.
 fn origin_for(st: &AppState, info: &toc::TocInfo) -> Origin {
-    if let Some(a) = tracked_owner(st, &info.folder) {
+    if let Some(a) = tracked_owner(st, &info.folder).filter(|a| a.provider != "local") {
         return Origin {
             provider: a.provider.clone(),
             source: a.source.clone(),
@@ -146,6 +156,9 @@ fn origin_for(st: &AppState, info: &toc::TocInfo) -> Origin {
     }
     if let Some(id) = &info.wowi_id {
         return Origin { provider: "wowi".into(), url: format!("https://www.wowinterface.com/downloads/info{id}"), source: id.clone(), asset_pattern: None, curse_id };
+    }
+    if let Some(id) = &info.curse_id {
+        return Origin { provider: "curse".into(), url: format!("https://www.curseforge.com/projects/{id}"), source: id.clone(), asset_pattern: None, curse_id };
     }
     Origin { provider: "local".into(), source: info.folder.clone(), url: String::new(), asset_pattern: None, curse_id }
 }
@@ -252,19 +265,37 @@ async fn install(ctx: tauri::State<'_, Ctx>, url: String, asset_pattern: Option<
         curse_id: None,
     };
     let mut st = ctx.state.lock().await;
-    do_install(&mut st, &ctx.client, o).await.map_err(err)
+    do_install(&mut st, &ctx.client, o, &[]).await.map_err(err)
+}
+
+/// Connect an addon (usually a manual one) to an online source and install the latest from there.
+#[tauri::command]
+async fn link_addon(ctx: tauri::State<'_, Ctx>, id: String, source: String) -> Res<TrackedAddon> {
+    let p = providers::parse_url(&source).map_err(err)?;
+    let mut st = ctx.state.lock().await;
+    let old = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
+    let curse_id = if p.provider == "curse" { Some(p.source.clone()) } else { old.curse_id.clone() };
+    let o = Origin { provider: p.provider.into(), source: p.source, url: p.url, asset_pattern: None, curse_id };
+    let new = do_install(&mut st, &ctx.client, o, &old.folders).await.map_err(err)?;
+    if new.id != old.id {
+        // Its folders were backed up/replaced by the install above.
+        st.addons.retain(|a| a.id != old.id);
+        st.save().map_err(err)?;
+    }
+    Ok(new)
 }
 
 #[tauri::command]
 async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
     let st = ctx.state.lock().await.clone();
+    let game = game::detect(Path::new(&st.addons_dir));
     let mut out = Vec::new();
     for a in &st.addons {
         if a.provider == "local" {
             out.push(UpdateInfo { id: a.id.clone(), current: a.version.clone(), latest: None, has_update: false, manual: true, error: None });
             continue;
         }
-        let r = providers::latest(&ctx.client, st.token(), &a.provider, &a.source, a.asset_pattern.as_deref()).await;
+        let r = providers::latest(&ctx.client, st.token(), &a.provider, &a.source, a.asset_pattern.as_deref(), &game).await;
         out.push(match r {
             Ok(rel) => UpdateInfo {
                 id: a.id.clone(),
@@ -285,7 +316,7 @@ async fn update_addon(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddo
     let mut st = ctx.state.lock().await;
     let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    do_install(&mut st, &ctx.client, o).await.map_err(err)
+    do_install(&mut st, &ctx.client, o, &[]).await.map_err(err)
 }
 
 /// Moves the addon's folders to the backup area (not a hard delete) and stops tracking it.
@@ -319,6 +350,7 @@ fn main() {
             scan_downloads,
             install_local,
             install,
+            link_addon,
             check_updates,
             update_addon,
             uninstall,

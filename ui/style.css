@@ -64,6 +64,7 @@ td.actions-cell { text-align: right; white-space: nowrap; }
 .folders { font-size: 12px; color: var(--muted); }
 .new { color: var(--ok); font-weight: 600; }
 .warn { color: var(--bad); font-size: 12px; }
+tr.link-row td { background: var(--bg); }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }
 .card-head h2 { margin-bottom: 10px; }
 .bad { color: var(--bad); }

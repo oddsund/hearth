@@ -11,16 +11,16 @@ pub struct TrackedAddon {
     /// Unique key, e.g. "github:DeadlyBossMods/DeadlyBossMods" or "wowi:12345".
     pub id: String,
     pub name: String,
-    /// "github" | "wowi"
+    /// "github" | "wowi" | "curse" | "local" (a zip with no online source)
     pub provider: String,
-    /// "owner/repo" for GitHub, numeric id for WoWInterface.
+    /// "owner/repo" for GitHub, numeric id for WoWInterface and CurseForge, folder name for local.
     pub source: String,
     /// Human-facing page URL.
     pub url: String,
     pub version: String,
     /// Folders in Interface\AddOns that belong to this addon.
     pub folders: Vec<String>,
-    /// Optional regex to pick a specific release asset (GitHub only).
+    /// Optional regex to pick a specific release asset or CurseForge file.
     #[serde(default)]
     pub asset_pattern: Option<String>,
     #[serde(default)]

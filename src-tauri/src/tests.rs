@@ -11,7 +11,42 @@ fn parses_urls() {
     let p = providers::parse_url("https://www.wowinterface.com/downloads/info5108-Clique.html").unwrap();
     assert_eq!((p.provider, p.source.as_str()), ("wowi", "5108"));
     assert!(providers::parse_url("https://www.curseforge.com/wow/addons/details").is_err());
+    let p = providers::parse_url(" 298842 ").unwrap();
+    assert_eq!((p.provider, p.source.as_str()), ("curse", "298842"));
+    let p = providers::parse_url("https://www.curseforge.com/projects/298842").unwrap();
+    assert_eq!(p.source, "298842");
     assert!(providers::parse_url("hello").is_err());
+}
+
+fn cf(id: u64, name: &str, versions: &[&str], release_type: u8) -> providers::CfFile {
+    providers::CfFile {
+        id,
+        display_name: name.trim_end_matches(".zip").into(),
+        file_name: name.into(),
+        game_versions: versions.iter().map(|s| s.to_string()).collect(),
+        release_type,
+    }
+}
+
+#[test]
+fn curse_picks_file_for_this_game() {
+    use crate::game::GameInfo;
+    // Newest first, like the API returns them.
+    let files = vec![
+        cf(5, "Addon-2.0-beta.zip", &["1.60.1"], 2),
+        cf(4, "Addon-2.0-titan.zip", &["3.80.0"], 1),
+        cf(3, "Addon-1.9-forever.zip", &["1.60.1"], 1),
+        cf(2, "Addon-12.1.zip", &["12.1.5"], 1),
+    ];
+    let forever = GameInfo { version: Some("1.60.2".into()), flavor: Some("forever".into()) };
+    assert_eq!(providers::pick_curse(&files, None, &forever).unwrap().id, 3, "stable, tagged 1.60.x");
+    let retail = GameInfo { version: Some("12.1.5".into()), flavor: Some("retail".into()) };
+    assert_eq!(providers::pick_curse(&files, None, &retail).unwrap().id, 2);
+    let untagged = GameInfo { version: None, flavor: Some("forever".into()) };
+    assert_eq!(providers::pick_curse(&files, None, &untagged).unwrap().id, 3, "flavor in file name");
+    let unknown = GameInfo { version: Some("9.9.9".into()), flavor: None };
+    assert!(providers::pick_curse(&files, None, &unknown).is_err(), "never guess another flavor");
+    assert_eq!(providers::pick_curse(&files, Some("titan"), &forever).unwrap().id, 4);
 }
 
 #[test]
@@ -89,9 +124,13 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().user_agent("hearth-test").build().unwrap()
 }
 
+fn forever() -> crate::game::GameInfo {
+    crate::game::GameInfo { version: Some("1.60.1".into()), flavor: Some("forever".into()) }
+}
+
 async fn install_into_temp(provider: &str, source: &str) {
     let c = client();
-    let rel = providers::latest(&c, None, provider, source, None).await.unwrap();
+    let rel = providers::latest(&c, None, provider, source, None, &forever()).await.unwrap();
     println!("{source}: {} <- {}", rel.version, rel.download_url);
     let dir = tempfile::tempdir().unwrap();
     let id = format!("test-{provider}:{source}");
@@ -117,4 +156,23 @@ async fn github_packaged_release() {
 #[ignore]
 async fn wowinterface_addon() {
     install_into_temp("wowi", "5108").await;
+}
+
+/// Leatrix Maps: should pick the -forever build, not retail.
+#[tokio::test]
+#[ignore]
+async fn curseforge_forever_build() {
+    let rel = providers::latest(&client(), None, "curse", "298842", None, &forever()).await.unwrap();
+    assert!(rel.version.contains("forever"), "got {}", rel.version);
+    install_into_temp("curse", "298842").await;
+}
+
+/// Reads the real WoW install (read-only).
+#[test]
+#[ignore]
+fn real_game_detection() {
+    let dir = crate::state::detect_addons_dir();
+    let g = crate::game::detect(std::path::Path::new(&dir));
+    println!("{dir}: {g:?}");
+    assert!(g.version.is_some());
 }

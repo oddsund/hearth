@@ -7,8 +7,13 @@ let dlRows = []; // zips found in Downloads
 let actionableRows = [];
 let busy = false;
 
+let linkOpen = null; // id of the addon whose Link editor is open
+
 const sourceLabel = (provider, source) =>
-  provider === "github" ? source : provider === "wowi" ? `WoWInterface #${source}` : "manual (zip only)";
+  provider === "github" ? source
+  : provider === "wowi" ? `WoWInterface #${source}`
+  : provider === "curse" ? `CurseForge #${source}`
+  : "manual (zip only)";
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -35,6 +40,20 @@ async function run(label, fn) {
   }
 }
 
+function linkRow(a) {
+  const hint = a.curse_id
+    ? `This zip names CurseForge project <code>${esc(a.curse_id)}</code>.`
+    : `On the addon's CurseForge page, the Project ID is in the "About Project" box.`;
+  return `<tr class="link-row"><td colspan="5">
+    <div class="row">
+      <input id="in-link" spellcheck="false" placeholder="CurseForge project ID, GitHub URL, or WoWInterface URL" value="${esc(a.curse_id ?? "")}">
+      <button class="small primary" data-link-go="${esc(a.id)}">Link &amp; update</button>
+      <button class="small ghost" data-link-cancel>Cancel</button>
+    </div>
+    <div class="folders">${hint} Hearth then installs the newest build for your game from there and keeps it updated.</div>
+  </td></tr>`;
+}
+
 function render() {
   const tb = $("tracked");
   tb.innerHTML = state.addons
@@ -52,9 +71,11 @@ function render() {
         <td>${esc(a.version)}</td>
         <td>${latest}</td>
         <td class="actions-cell">
-          ${a.provider === "local" ? "" : `<button class="small" data-update="${esc(a.id)}">${u?.has_update ? "Update" : "Reinstall"}</button>`}
+          ${a.provider === "local"
+            ? `<button class="small primary" data-link="${esc(a.id)}">Link</button>`
+            : `<button class="small" data-update="${esc(a.id)}">${u?.has_update ? "Update" : "Reinstall"}</button>`}
           <button class="small danger" data-remove="${esc(a.id)}">Remove</button>
-        </td></tr>`;
+        </td></tr>${linkOpen === a.id ? linkRow(a) : ""}`;
     })
     .join("");
   // Downloads: show what can be installed/updated; just count the rest.
@@ -76,7 +97,11 @@ function render() {
         <td class="folders">${esc(r.file_name)}</td>
         <td>${ver}</td>
         <td>${esc(sourceLabel(r.link_provider, r.link_source))}</td>
-        <td class="actions-cell"><button class="small ${r.status === "new" ? "" : "primary"}" data-local="${i}">${label[r.status]}</button></td>
+        <td class="actions-cell">${
+          r.compatible === false && r.link_provider !== "local"
+            ? `<button class="small primary" data-remote="${i}" title="Install the newest build for your game from ${esc(sourceLabel(r.link_provider, r.link_source))} instead of this zip">Get build for your game</button>`
+            : `<button class="small ${r.status === "new" ? "" : "primary"}" data-local="${i}">${label[r.status]}</button>`
+        }</td>
       </tr>`;
     })
     .join("");
@@ -181,7 +206,20 @@ $("btn-update-all").onclick = () =>
 
 $("btn-rescan").onclick = () => run("Scanning Downloads", async () => { await refresh(); status("Rescanned Downloads."); });
 
+const sourceUrl = (provider, source) =>
+  provider === "wowi" ? `https://www.wowinterface.com/downloads/info${source}` : source; // github: owner/repo, curse: id
+
 $("downloads").onclick = (e) => {
+  const ri = e.target.closest("[data-remote]")?.dataset.remote;
+  if (ri !== undefined) {
+    const r = actionableRows[Number(ri)];
+    return run(`Getting ${r.main.title} from ${sourceLabel(r.link_provider, r.link_source)}`, async () => {
+      const a = await invoke("install", { url: sourceUrl(r.link_provider, r.link_source), assetPattern: null });
+      delete updates[a.id];
+      await refresh();
+      status(`Installed ${a.name} ${a.version} from ${sourceLabel(a.provider, a.source)}.`);
+    });
+  }
   const i = e.target.closest("[data-local]")?.dataset.local;
   if (i === undefined) return;
   const r = actionableRows[Number(i)];
@@ -197,6 +235,29 @@ $("downloads").onclick = (e) => {
 $("tracked").onclick = (e) => {
   const up = e.target.closest("[data-update]")?.dataset.update;
   const rm = e.target.closest("[data-remove]")?.dataset.remove;
+  const ln = e.target.closest("[data-link]")?.dataset.link;
+  const go = e.target.closest("[data-link-go]")?.dataset.linkGo;
+  if (e.target.closest("[data-link-cancel]")) {
+    linkOpen = null;
+    return render();
+  }
+  if (ln) {
+    linkOpen = linkOpen === ln ? null : ln;
+    render();
+    $("in-link")?.focus();
+    return;
+  }
+  if (go) {
+    const source = $("in-link").value.trim();
+    if (!source) return status("Paste a CurseForge project ID, GitHub URL or WoWInterface URL.", true);
+    return run("Linking", async () => {
+      const a = await invoke("link_addon", { id: go, source });
+      linkOpen = null;
+      delete updates[go];
+      await refresh();
+      status(`${a.name} now updates from ${sourceLabel(a.provider, a.source)} (installed ${a.version}).`);
+    });
+  }
   if (up)
     run("Updating " + up, async () => {
       const a = await invoke("update_addon", { id: up });
