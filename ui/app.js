@@ -41,6 +41,15 @@ const sourceLabel = (provider, source) =>
   : provider === "curse" ? `CurseForge #${source}`
   : "manual (zip only)";
 
+// Some CurseForge files are named like "ForeverDungeonJournal1.6.6.zip", and that name is
+// the version. For buttons, keep just the version: "1.6.6", "1.60.27-forever", "v427.8".
+function shortVersion(v) {
+  const s = String(v ?? "").replace(/\.zip$/i, "");
+  if (/^commit [0-9a-f]+$/i.test(s)) return s; // GitHub branch tracking: already short
+  const m =s.match(/v?\d+(?:\.\d+)+(?:-[a-z0-9]+)*/i) ?? s.match(/v?\d+(?:-[a-z0-9]+)*/i);
+  return m ? m[0] : s;
+}
+
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -224,8 +233,8 @@ function render() {
               : jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "") +
                 ` <button class="small ghost" data-pin="${esc(a.id)}" data-pin-to="1" title="Stay on ${esc(a.version)}: skip this addon when checking for and installing updates">Pin</button>`}
           ${a.id in rollbacks
-            ? jobButton("rb:" + a.id, `data-rollback="${esc(a.id)}" title="Swap back to the version Hearth replaced. You can roll forward again the same way."`,
-                rollbacks[a.id] ? `Roll back to ${esc(rollbacks[a.id])}` : "Roll back", "ghost")
+            ? jobButton("rb:" + a.id, `data-rollback="${esc(a.id)}" title="Swap back to ${esc(rollbacks[a.id] || "the version Hearth replaced")}. You can roll forward again the same way."`,
+                rollbacks[a.id] ? `Roll back to ${esc(shortVersion(rollbacks[a.id]))}` : "Roll back", "ghost")
             : ""}
           <button class="small danger" data-remove="${esc(a.id)}" ${["up:", "ln:", "rb:"].some((k) => jobs.has(k + a.id)) ? "disabled" : ""}>Remove</button>
         </td></tr>${linkOpen === a.id ? linkRow(a) : ""}${notesOpen === a.id ? notesRow(a) : ""}`;
