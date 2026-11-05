@@ -6,6 +6,18 @@ let updates = {}; // id -> UpdateInfo
 let dlRows = []; // zips found in Downloads
 let rollbacks = {}; // id -> version a roll back would restore ("" = unknown)
 let adoptGroups = []; // hand-installed addons Hearth could start tracking
+let missingDeps = {}; // id -> [{folder, zip_path, zip_file}]
+
+function depWarnings(a) {
+  return (missingDeps[a.id] ?? [])
+    .map((d) => {
+      const fix = d.zip_path
+        ? jobButton("dl:" + d.zip_path, `data-dep-zip="${esc(d.zip_path)}" data-dep-name="${esc(d.folder)}"`, `Install from ${esc(d.zip_file)}`)
+        : extLink(`https://www.curseforge.com/wow/search?class=addons&search=${encodeURIComponent(d.folder)}`, `Search CurseForge for ${d.folder} ↗`);
+      return `<div class="warn">Needs <strong>${esc(d.folder)}</strong>, which isn't installed. ${fix}</div>`;
+    })
+    .join("");
+}
 let actionableRows = [];
 let busy = false;
 
@@ -184,7 +196,7 @@ function render() {
       else if (u) latest = '<span class="muted">up to date</span>';
       const src = sourceLabel(a.provider, a.source);
       return `<tr>
-        <td><strong>${esc(a.name)}</strong><div class="folders">${a.folders.map(esc).join(", ")}</div></td>
+        <td><strong>${esc(a.name)}</strong><div class="folders">${a.folders.map(esc).join(", ")}</div>${depWarnings(a)}</td>
         <td>${a.url ? extLink(a.url, src) : esc(src)}${a.asset_pattern ? `<div class="folders">pattern: <code>${esc(a.asset_pattern)}</code></div>` : ""}</td>
         <td>${esc(a.version)}</td>
         <td>${latest}</td>
@@ -260,6 +272,7 @@ async function refresh() {
   $("in-iface").value = state.game_interface;
   dlRows = await invoke("scan_downloads");
   rollbacks = await invoke("rollback_options");
+  missingDeps = Object.fromEntries((await invoke("missing_dependencies")).map((r) => [r.id, r.missing]));
   adoptGroups = await invoke("adoptable_addons");
   $("untracked-card").hidden = adoptGroups.length === 0;
   $("untracked").innerHTML = adoptGroups
@@ -473,7 +486,15 @@ $("tracked").onclick = (e) => {
     });
   }
   if (up) enqueueUpdate(up);
-  const rb = e.target.closest("[data-rollback]")?.dataset.rollback;
+  const depZip = e.target.closest("[data-dep-zip]");
+  if (depZip) {
+    const path = depZip.dataset.depZip;
+    enqueue("dl:" + path, depZip.dataset.depName, async () => {
+      const a = await invoke("install_local", { path });
+      return `${a.name} ${a.version} (dependency)`;
+    });
+  }
+  const rb =e.target.closest("[data-rollback]")?.dataset.rollback;
   if (rb) {
     const name = state.addons.find((a) => a.id === rb)?.name ?? rb;
     enqueue("rb:" + rb, name, async () => {

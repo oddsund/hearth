@@ -81,6 +81,48 @@ fn adoptable(st: &AppState) -> Vec<AdoptGroup> {
 }
 
 #[derive(Serialize)]
+struct MissingDep {
+    folder: String,
+    /// A zip in Downloads that provides it, if any.
+    zip_path: Option<String>,
+    zip_file: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DepReport {
+    id: String,
+    missing: Vec<MissingDep>,
+}
+
+/// Required dependencies of tracked addons that aren't in AddOns. Blizzard_* ship with the game.
+fn missing_deps(st: &AppState, zips: &[downloads::Candidate]) -> Vec<DepReport> {
+    let dir = Path::new(&st.addons_dir);
+    let present = |f: &str| dir.join(f).is_dir();
+    st.addons
+        .iter()
+        .filter_map(|a| {
+            let mut missing: Vec<MissingDep> = Vec::new();
+            for f in &a.folders {
+                for d in toc::read_info(&dir.join(f)).map(|i| i.deps).unwrap_or_default() {
+                    let own = a.folders.iter().any(|x| x.eq_ignore_ascii_case(&d));
+                    let known = missing.iter().any(|m| m.folder.eq_ignore_ascii_case(&d));
+                    if own || known || present(&d) || d.to_lowercase().starts_with("blizzard_") {
+                        continue;
+                    }
+                    let zip = zips.iter().find(|z| z.folders.iter().any(|zf| zf.eq_ignore_ascii_case(&d)));
+                    missing.push(MissingDep {
+                        folder: d,
+                        zip_path: zip.map(|z| z.path.clone()),
+                        zip_file: zip.map(|z| z.file_name.clone()),
+                    });
+                }
+            }
+            (!missing.is_empty()).then(|| DepReport { id: a.id.clone(), missing })
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
 struct UpdateInfo {
     id: String,
     current: String,
@@ -320,6 +362,17 @@ async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
 }
 
 #[tauri::command]
+async fn missing_dependencies(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DepReport>> {
+    let st = ctx.state.lock().await.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let zips = if st.downloads_dir.is_empty() { vec![] } else { downloads::scan(Path::new(&st.downloads_dir)) };
+        missing_deps(&st, &zips)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn adoptable_addons(ctx: tauri::State<'_, Ctx>) -> Res<Vec<AdoptGroup>> {
     Ok(adoptable(&*ctx.state.lock().await))
 }
@@ -554,6 +607,7 @@ fn main() {
             downloads_signature,
             adoptable_addons,
             adopt,
+            missing_dependencies,
             install_local,
             install,
             link_addon,

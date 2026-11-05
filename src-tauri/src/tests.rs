@@ -199,6 +199,37 @@ async fn curseforge_forever_build() {
 }
 
 #[test]
+fn finds_missing_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let addon = |folder: &str, body: &str| {
+        std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+        std::fs::write(dir.path().join(folder).join(format!("{folder}.toc")), body).unwrap();
+    };
+    addon("Foo", "## Dependencies: Foo_Core, LibThing\n## OptionalDeps: Masque\n");
+    addon("Foo_Core", "## RequiredDeps: Blizzard_UIPanels, HereLib\n");
+    addon("HereLib", "## Title: HereLib\n");
+    let tracked = |id: &str, folders: &[&str]| crate::state::TrackedAddon {
+        id: id.into(), name: id.into(), provider: "local".into(), source: id.into(), url: String::new(),
+        version: "1".into(), folders: folders.iter().map(|s| s.to_string()).collect(),
+        asset_pattern: None, installed_at: 0, curse_id: None,
+    };
+    let st = crate::state::AppState {
+        addons_dir: dir.path().to_string_lossy().into(),
+        addons: vec![tracked("local:Foo", &["Foo", "Foo_Core"])],
+        ..Default::default()
+    };
+    let zip = crate::downloads::Candidate {
+        path: "/dl/LibThing.zip".into(), file_name: "LibThing.zip".into(), modified: 0,
+        folders: vec!["LibThing".into()], main: Default::default(),
+    };
+    let r = crate::missing_deps(&st, &[zip]);
+    assert_eq!(r.len(), 1);
+    let missing: Vec<(&str, Option<&str>)> = r[0].missing.iter().map(|m| (m.folder.as_str(), m.zip_file.as_deref())).collect();
+    // Own folder, installed lib, Blizzard_* and optional deps don't count.
+    assert_eq!(missing, vec![("LibThing", Some("LibThing.zip"))]);
+}
+
+#[test]
 fn groups_hand_installed_folders() {
     let dir = tempfile::tempdir().unwrap();
     let addon = |folder: &str, body: &str| {

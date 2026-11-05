@@ -19,6 +19,8 @@ pub struct TocInfo {
     pub wago_id: Option<String>,
     /// "owner/repo" if any toc field links to GitHub.
     pub github: Option<String>,
+    /// Required addons (## Dependencies / ## RequiredDeps / ## Dep*), not optional ones.
+    pub deps: Vec<String>,
 }
 
 impl TocInfo {
@@ -128,9 +130,25 @@ fn github_repo(m: &HashMap<String, String>) -> Option<String> {
         .next()
 }
 
+/// WoW treats "Dependencies", "RequiredDeps" and any key starting with "Dep" as required.
+fn required_deps(m: &HashMap<String, String>) -> Vec<String> {
+    let mut keys: Vec<&String> = m.keys().filter(|k| k.starts_with("dep") || *k == "requireddeps").collect();
+    keys.sort();
+    let mut out: Vec<String> = Vec::new();
+    for k in keys {
+        for d in m[k].split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(d)) {
+                out.push(d.to_string());
+            }
+        }
+    }
+    out
+}
+
 pub fn info_from(folder: String, m: &HashMap<String, String>) -> TocInfo {
     let get = |k: &str| m.get(k).filter(|v| !v.is_empty()).cloned();
     TocInfo {
+        deps: required_deps(m),
         github: github_repo(m),
         title: get("title").map(|t| strip_codes(&t)).unwrap_or_else(|| folder.clone()),
         version: get("version"),
