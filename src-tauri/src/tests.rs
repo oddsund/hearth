@@ -100,9 +100,36 @@ fn local_zip_discovery_and_install() {
     assert_eq!(c.main.supports("38000"), Some(false));
 
     let bytes = std::fs::read(&c.path).unwrap();
-    let folders = installer::install_bytes(addons.path(), "test-local:Foo", &bytes, &[]).unwrap();
+    let folders = installer::install_bytes(addons.path(), "test-local:Foo", &bytes, &[], None).unwrap();
     assert_eq!(folders.len(), 2);
     assert!(addons.path().join("Foo/Foo.lua").is_file());
+}
+
+/// Install v1, update to v2, roll back to v1, roll back again to v2.
+#[test]
+fn roll_back_swaps_versions() {
+    use std::io::Write;
+    let addons = tempfile::tempdir().unwrap();
+    let id = format!("test-rollback:{}", std::process::id());
+    let zip_with = |ver: &str| {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut z = zip::ZipWriter::new(&mut buf);
+        z.start_file("Bar/Bar.toc", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(format!("## Version: {ver}\n").as_bytes()).unwrap();
+        z.finish().unwrap();
+        buf.into_inner()
+    };
+    let ver_on_disk = || toc::read_info(&addons.path().join("Bar")).unwrap().version.unwrap();
+    let f = installer::install_bytes(addons.path(), &id, &zip_with("1.0"), &[], None).unwrap();
+    installer::install_bytes(addons.path(), &id, &zip_with("2.0"), &f, Some("1.0")).unwrap();
+    assert_eq!(ver_on_disk(), "2.0");
+    assert_eq!(installer::latest_backup(&id).unwrap().1.version.as_deref(), Some("1.0"));
+
+    let m = installer::roll_back(addons.path(), &id, &f, "2.0").unwrap();
+    assert_eq!((m.version.as_deref(), ver_on_disk().as_str()), (Some("1.0"), "1.0"));
+    let m = installer::roll_back(addons.path(), &id, &f, "1.0").unwrap();
+    assert_eq!((m.version.as_deref(), ver_on_disk().as_str()), (Some("2.0"), "2.0"));
+    let _ = std::fs::remove_dir_all(crate::state::data_dir().join("backup").join(id.replace(':', "_")));
 }
 
 /// Read-only look at the real Downloads folder.

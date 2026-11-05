@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 let state = { addons: [], addons_dir: "" };
 let updates = {}; // id -> UpdateInfo
 let dlRows = []; // zips found in Downloads
+let rollbacks = {}; // id -> version a roll back would restore ("" = unknown)
 let actionableRows = [];
 let busy = false;
 
@@ -161,7 +162,11 @@ function render() {
           ${a.provider === "local"
             ? jobButton("ln:" + a.id, `data-link="${esc(a.id)}"`, "Link", "primary")
             : jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "")}
-          <button class="small danger" data-remove="${esc(a.id)}" ${jobs.has("up:" + a.id) || jobs.has("ln:" + a.id) ? "disabled" : ""}>Remove</button>
+          ${a.id in rollbacks
+            ? jobButton("rb:" + a.id, `data-rollback="${esc(a.id)}" title="Swap back to the version Hearth replaced. You can roll forward again the same way."`,
+                rollbacks[a.id] ? `Roll back to ${esc(rollbacks[a.id])}` : "Roll back", "ghost")
+            : ""}
+          <button class="small danger" data-remove="${esc(a.id)}" ${["up:", "ln:", "rb:"].some((k) => jobs.has(k + a.id)) ? "disabled" : ""}>Remove</button>
         </td></tr>${linkOpen === a.id ? linkRow(a) : ""}`;
     })
     .join("");
@@ -224,6 +229,7 @@ async function refresh() {
   $("in-dl").value = state.downloads_dir;
   $("in-iface").value = state.game_interface;
   dlRows = await invoke("scan_downloads");
+  rollbacks = await invoke("rollback_options");
   const rows = await invoke("scan");
   const untracked = rows.filter((r) => !r.tracked_by);
   $("untracked-card").hidden = untracked.length === 0;
@@ -368,6 +374,15 @@ $("tracked").onclick = (e) => {
     });
   }
   if (up) enqueueUpdate(up);
+  const rb = e.target.closest("[data-rollback]")?.dataset.rollback;
+  if (rb) {
+    const name = state.addons.find((a) => a.id === rb)?.name ?? rb;
+    enqueue("rb:" + rb, name, async () => {
+      const a = await invoke("roll_back", { id: rb });
+      delete updates[rb];
+      return `${a.name} rolled back to ${a.version}`;
+    });
+  }
   if (rm) {
     const a = state.addons.find((x) => x.id === rm);
     if (!confirm(`Remove ${a?.name}? Its folders are moved to the backup folder, not deleted.`)) return;

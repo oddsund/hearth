@@ -142,8 +142,18 @@ async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Resul
             old.push(f.clone());
         }
     }
-    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old)?;
+    let old_version = tracked_version(&st, &id, &old);
+    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old, old_version.as_deref())?;
     record(&mut st, o, rel.version, folders)
+}
+
+/// Version being replaced: the tracked entry's, else whoever owns those folders.
+fn tracked_version(st: &AppState, id: &str, folders: &[String]) -> Option<String> {
+    st.addons
+        .iter()
+        .find(|a| a.id == id)
+        .or_else(|| folders.first().and_then(|f| tracked_owner(st, f)))
+        .map(|a| a.version.clone())
 }
 
 fn tracked_owner<'a>(st: &'a AppState, folder: &str) -> Option<&'a TrackedAddon> {
@@ -269,7 +279,9 @@ async fn install_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<TrackedA
     let mut st = ctx.state.lock().await;
     let o = origin_for(&st, &info);
     let id = o.id();
-    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old_folders(&st, &id)).map_err(err)?;
+    let old = old_folders(&st, &id);
+    let old_version = tracked_version(&st, &id, &old);
+    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old, old_version.as_deref()).map_err(err)?;
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
     record(&mut st, o, version, folders).map_err(err)
 }
@@ -348,10 +360,36 @@ async fn update_addon(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddo
 async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
     let mut st = ctx.state.lock().await;
     let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
-    installer::backup_folders(Path::new(&st.addons_dir), &a.id, &a.folders).map_err(err)?;
+    installer::backup_folders(Path::new(&st.addons_dir), &a.id, &a.folders, Some(&a.version)).map_err(err)?;
     st.addons.retain(|x| x.id != id);
     st.save().map_err(err)?;
     Ok(())
+}
+
+/// For each tracked addon with a backup: the version it would roll back to ("" if unknown).
+#[tauri::command]
+async fn rollback_options(ctx: tauri::State<'_, Ctx>) -> Res<std::collections::HashMap<String, String>> {
+    let st = ctx.state.lock().await;
+    Ok(st
+        .addons
+        .iter()
+        .filter_map(|a| installer::latest_backup(&a.id).map(|(_, m)| (a.id.clone(), m.version.unwrap_or_default())))
+        .collect())
+}
+
+/// Swap an addon back to its backed-up version (and keep the current one as the new backup).
+#[tauri::command]
+async fn roll_back(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> {
+    let mut st = ctx.state.lock().await;
+    let addons_dir = PathBuf::from(&st.addons_dir);
+    let a = st.addons.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("{id} isn't tracked"))?;
+    let meta = installer::roll_back(&addons_dir, &a.id, &a.folders, &a.version).map_err(err)?;
+    a.version = meta.version.unwrap_or_else(|| "previous".into());
+    a.folders = meta.folders;
+    a.installed_at = installer::now();
+    let out = a.clone();
+    st.save().map_err(err)?;
+    Ok(out)
 }
 
 /// Open a web page in the user's normal (Windows) browser. Only for the addon sites Hearth links to.
@@ -407,6 +445,8 @@ fn main() {
             check_updates,
             update_addon,
             uninstall,
+            rollback_options,
+            roll_back,
             open_url,
             backup_location
         ])

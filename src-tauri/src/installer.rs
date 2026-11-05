@@ -148,10 +148,36 @@ fn backup_root(id: &str) -> PathBuf {
     data_dir().join("backup").join(safe(id))
 }
 
+const BACKUP_META: &str = "hearth-backup.json";
+
+/// What a backup folder holds, so it can be restored as a version.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct BackupMeta {
+    pub version: Option<String>,
+    pub folders: Vec<String>,
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Backups for an addon, oldest first (folder names are timestamps; older ones are in seconds).
+fn sorted_backups(id: &str) -> Vec<PathBuf> {
+    let mut v = subdirs(&backup_root(id));
+    let key = |p: &PathBuf| -> u128 {
+        let n: u128 = p.file_name().and_then(|n| n.to_str()).and_then(|s| s.parse().ok()).unwrap_or(0);
+        if n < 100_000_000_000 { n * 1000 } else { n } // seconds -> ms
+    };
+    v.sort_by_key(key);
+    v
+}
+
 /// Keep only the newest backup per addon.
 fn prune_backups(id: &str) {
-    let mut v = subdirs(&backup_root(id));
-    v.sort();
+    let v = sorted_backups(id);
     if v.len() > 1 {
         for old in &v[..v.len() - 1] {
             let _ = fs::remove_dir_all(old);
@@ -159,9 +185,24 @@ fn prune_backups(id: &str) {
     }
 }
 
+/// The newest backup and what it holds (only backups that recorded a version can be rolled back to).
+pub fn latest_backup(id: &str) -> Option<(PathBuf, BackupMeta)> {
+    let dir = sorted_backups(id).pop()?;
+    let meta: BackupMeta = serde_json::from_slice(&fs::read(dir.join(BACKUP_META)).ok()?).ok()?;
+    meta.folders.iter().all(|f| is_folder_name(f) && dir.join(f).is_dir()).then_some((dir, meta))
+}
+
 /// Move folders out of AddOns into a backup dir. Used for uninstall and before upgrades.
-pub fn backup_folders(addons_dir: &Path, id: &str, folders: &[String]) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let bdir = backup_root(id).join(now().to_string());
+pub fn backup_folders(addons_dir: &Path, id: &str, folders: &[String], version: Option<&str>) -> Result<Vec<(PathBuf, PathBuf)>> {
+    if let Some(f) = folders.iter().find(|f| !is_folder_name(f)) {
+        bail!("Refusing to move {f:?}: not an addon folder name");
+    }
+    // A new folder per backup, even when two land in the same millisecond.
+    let mut ms = now_ms();
+    while backup_root(id).join(ms.to_string()).exists() {
+        ms += 1;
+    }
+    let bdir = backup_root(id).join(ms.to_string());
     let mut moved = Vec::new();
     for f in folders {
         let live = addons_dir.join(f);
@@ -176,7 +217,37 @@ pub fn backup_folders(addons_dir: &Path, id: &str, folders: &[String]) -> Result
         }
         moved.push((live, to));
     }
+    if !moved.is_empty() {
+        let meta = BackupMeta {
+            version: version.map(String::from),
+            folders: moved.iter().filter_map(|(l, _)| l.file_name()).map(|n| n.to_string_lossy().into_owned()).collect(),
+        };
+        let _ = fs::write(bdir.join(BACKUP_META), serde_json::to_vec_pretty(&meta).unwrap_or_default());
+    }
     Ok(moved)
+}
+
+/// Swap the current folders with the newest backup. The current version becomes the backup,
+/// so rolling back twice returns to where you started.
+pub fn roll_back(addons_dir: &Path, id: &str, current: &[String], current_version: &str) -> Result<BackupMeta> {
+    let (target, meta) = latest_backup(id).ok_or_else(|| anyhow::anyhow!("No earlier version is backed up"))?;
+    let moved = backup_folders(addons_dir, id, current, Some(current_version))?;
+    let mut placed: Vec<(String, PathBuf)> = Vec::new();
+    for f in &meta.folders {
+        let dst = addons_dir.join(f);
+        if let Err(e) = move_dir(&target.join(f), &dst) {
+            // Put the backup folders back where they were, then restore the current version.
+            for (f2, p) in &placed {
+                let _ = move_dir(p, &target.join(f2));
+            }
+            restore(&moved);
+            return Err(e).with_context(|| format!("Couldn't restore {f} (is WoW running?)"));
+        }
+        placed.push((f.clone(), dst));
+    }
+    let _ = fs::remove_dir_all(&target);
+    prune_backups(id);
+    Ok(meta)
 }
 
 fn restore(moved: &[(PathBuf, PathBuf)]) {
@@ -199,11 +270,12 @@ pub async fn install(
         bail!("AddOns folder not found: {}. Check Settings.", addons_dir.display());
     }
     let bytes = download(client, download_url).await?;
-    install_bytes(addons_dir, id, &bytes, old_folders)
+    install_bytes(addons_dir, id, &bytes, old_folders, None)
 }
 
 /// Install from zip bytes already in memory (downloaded or a local file).
-pub fn install_bytes(addons_dir: &Path, id: &str, bytes: &[u8], old_folders: &[String]) -> Result<Vec<String>> {
+/// `old_version` is recorded with the backup of the replaced folders, for roll back.
+pub fn install_bytes(addons_dir: &Path, id: &str, bytes: &[u8], old_folders: &[String], old_version: Option<&str>) -> Result<Vec<String>> {
     if !addons_dir.is_dir() {
         bail!("AddOns folder not found: {}. Check Settings.", addons_dir.display());
     }
@@ -218,7 +290,7 @@ pub fn install_bytes(addons_dir: &Path, id: &str, bytes: &[u8], old_folders: &[S
         }
     }
 
-    let moved = backup_folders(addons_dir, id, &replace)?;
+    let moved = backup_folders(addons_dir, id, &replace, old_version)?;
 
     let mut placed: Vec<PathBuf> = Vec::new();
     for (name, src) in &staged {
