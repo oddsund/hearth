@@ -81,11 +81,15 @@
   </section>
 
   <section class="card" id="untracked-card" hidden>
-    <h2>Other folders in AddOns <span class="muted">(not managed by Hearth)</span></h2>
+    <div class="card-head">
+      <h2>Installed by hand <span class="muted">(in AddOns, not managed by Hearth)</span></h2>
+      <button id="btn-adopt-all" class="small primary">Track all</button>
+    </div>
     <table>
-      <thead><tr><th>Folder</th><th>Title</th><th>Version</th><th>Known ids</th></tr></thead>
+      <thead><tr><th>Addon</th><th>Version</th><th>Updates from</th><th></th></tr></thead>
       <tbody id="untracked"></tbody>
     </table>
+    <p class="muted">Tracking only records what's there; nothing is downloaded. Online addons get updates from then on, manual ones can be linked.</p>
   </section>
 
   <div id="status" role="status"></div>

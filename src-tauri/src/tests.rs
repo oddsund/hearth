@@ -199,6 +199,32 @@ async fn curseforge_forever_build() {
 }
 
 #[test]
+fn groups_hand_installed_folders() {
+    let dir = tempfile::tempdir().unwrap();
+    let addon = |folder: &str, body: &str| {
+        std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+        std::fs::write(dir.path().join(folder).join(format!("{folder}.toc")), body).unwrap();
+    };
+    addon("BigWigs", "## Title: BigWigs\n## Version: v1\n## X-Curse-Project-ID: 2382\n");
+    addon("BigWigs_Core", "## Title: BigWigs Core\n");
+    addon("BigWigs_Options", "## Title: BigWigs Options\n");
+    addon("Clique", "## Title: Clique\n## X-WoWI-ID: 5108\n");
+    addon("CliqueExtras", "## Title: Clique extras\n## X-WoWI-ID: 5108\n"); // joins by shared id
+    addon("Plain", "## Title: Plain\n");
+    let st = crate::state::AppState { addons_dir: dir.path().to_string_lossy().into(), ..Default::default() };
+    let mut groups: Vec<(String, Vec<String>, String)> = crate::adoptable(&st)
+        .into_iter()
+        .map(|g| (g.main.folder, g.folders, g.link_provider))
+        .collect();
+    groups.sort();
+    assert_eq!(groups, vec![
+        ("BigWigs".into(), vec!["BigWigs".into(), "BigWigs_Core".into(), "BigWigs_Options".into()], "curse".into()),
+        ("Clique".into(), vec!["Clique".into(), "CliqueExtras".into()], "wowi".into()),
+        ("Plain".into(), vec!["Plain".into()], "local".into()),
+    ]);
+}
+
+#[test]
 fn settings_snapshot_and_restore() {
     let root = tempfile::tempdir().unwrap();
     let flavor = root.path().join(format!("_hearthtest{}_", std::process::id()));

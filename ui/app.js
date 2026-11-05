@@ -5,6 +5,7 @@ let state = { addons: [], addons_dir: "" };
 let updates = {}; // id -> UpdateInfo
 let dlRows = []; // zips found in Downloads
 let rollbacks = {}; // id -> version a roll back would restore ("" = unknown)
+let adoptGroups = []; // hand-installed addons Hearth could start tracking
 let actionableRows = [];
 let busy = false;
 
@@ -243,7 +244,7 @@ function render() {
   $("empty").hidden = state.addons.length > 0;
   $("count").textContent = state.addons.length ? `(${state.addons.length})` : "";
 
-  for (const id of ["btn-check", "btn-save", "btn-rescan"]) $(id).disabled = busy;
+  for (const id of ["btn-check", "btn-save", "btn-rescan", "btn-adopt-all", "btn-wtf-now"]) $(id).disabled = busy;
   const pending = Object.values(updates).filter((u) => u.has_update && !jobs.has("up:" + u.id)).length;
   $("btn-update-all").disabled = busy || !pending;
   $("btn-update-all").textContent = pending ? `Update all (${pending})` : "Update all";
@@ -259,18 +260,15 @@ async function refresh() {
   $("in-iface").value = state.game_interface;
   dlRows = await invoke("scan_downloads");
   rollbacks = await invoke("rollback_options");
-  const rows = await invoke("scan");
-  const untracked = rows.filter((r) => !r.tracked_by);
-  $("untracked-card").hidden = untracked.length === 0;
-  $("untracked").innerHTML = untracked
-    .map((r) => {
-      const ids = [
-        r.curse_id && `Curse ${r.curse_id}`,
-        r.wowi_id && `WoWI ${r.wowi_id}`,
-        r.wago_id && `Wago ${r.wago_id}`,
-      ].filter(Boolean);
-      return `<tr><td>${esc(r.folder)}</td><td>${esc(r.title)}</td><td>${esc(r.version ?? "")}</td><td class="folders">${esc(ids.join(" · "))}</td></tr>`;
-    })
+  adoptGroups = await invoke("adoptable_addons");
+  $("untracked-card").hidden = adoptGroups.length === 0;
+  $("untracked").innerHTML = adoptGroups
+    .map((g, i) => `<tr>
+        <td><strong>${esc(g.main.title)}</strong><div class="folders">${g.folders.map(esc).join(", ")}</div></td>
+        <td>${esc(g.main.version ?? "?")}</td>
+        <td>${esc(sourceLabel(g.link_provider, g.link_source))}</td>
+        <td class="actions-cell"><button class="small" data-adopt="${i}">Track</button></td>
+      </tr>`)
     .join("");
   if (!state.addons_dir) {
     $("settings").hidden = false;
@@ -404,7 +402,26 @@ function enqueueUpdate(id) {
 $("btn-update-all").onclick = () =>
   Object.values(updates).filter((u) => u.has_update).forEach((u) => enqueueUpdate(u.id));
 
-$("btn-rescan").onclick = () => run("Scanning Downloads", async () => { await refresh(); status("Rescanned Downloads."); });
+async function adoptGroupsNow(groups) {
+  const done = [], failed = [];
+  for (const g of groups) {
+    try { done.push((await invoke("adopt", { folders: g.folders })).name); }
+    catch (e) { failed.push(`${g.main.title}: ${e}`); }
+  }
+  await refresh();
+  status(
+    (done.length ? `Now tracking ${done.join(", ")}.` : "") + (failed.length ? `\nFailed: ${failed.join("; ")}` : ""),
+    failed.length > 0
+  );
+}
+$("untracked").onclick = (e) => {
+  const i = e.target.closest("[data-adopt]")?.dataset.adopt;
+  // Afterwards, check for updates: online ones may already be out of date.
+  if (i !== undefined) run("Tracking", () => adoptGroupsNow([adoptGroups[Number(i)]])).then(autoCheck);
+};
+$("btn-adopt-all").onclick = () => run("Tracking", () => adoptGroupsNow([...adoptGroups])).then(autoCheck);
+
+$("btn-rescan").onclick =() => run("Scanning Downloads", async () => { await refresh(); status("Rescanned Downloads."); });
 
 const sourceUrl = (provider, source) =>
   provider === "wowi" ? `https://www.wowinterface.com/downloads/info${source}` : source; // github: owner/repo, curse: id

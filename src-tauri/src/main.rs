@@ -41,6 +41,45 @@ struct ScanRow {
     tracked_by: Option<String>,
 }
 
+/// Untracked folders that look like one addon (main folder + its modules).
+#[derive(Serialize)]
+struct AdoptGroup {
+    main: toc::TocInfo,
+    folders: Vec<String>,
+    link_provider: String,
+    link_source: String,
+}
+
+/// Group untracked folders: "BigWigs_Core" joins "BigWigs"; folders sharing a Curse/WoWI id join.
+fn adoptable(st: &AppState) -> Vec<AdoptGroup> {
+    let mut infos: Vec<toc::TocInfo> = toc::scan(Path::new(&st.addons_dir))
+        .into_iter()
+        .filter(|t| tracked_owner(st, &t.folder).is_none())
+        .collect();
+    infos.sort_by_key(|t| (t.folder.len(), t.folder.to_lowercase()));
+    let mut groups: Vec<(toc::TocInfo, Vec<String>)> = Vec::new();
+    for t in infos {
+        let lower = t.folder.to_lowercase();
+        let same_id = |a: &Option<String>, b: &Option<String>| a.is_some() && a == b;
+        let home = groups.iter_mut().find(|(m, _)| {
+            let base = m.folder.to_lowercase();
+            lower.starts_with(&format!("{base}_")) || lower.starts_with(&format!("{base}-"))
+                || same_id(&m.curse_id, &t.curse_id) || same_id(&m.wowi_id, &t.wowi_id)
+        });
+        match home {
+            Some((_, folders)) => folders.push(t.folder),
+            None => groups.push((t.clone(), vec![t.folder])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(main, folders)| {
+            let o = origin_for(st, &main);
+            AdoptGroup { main, folders, link_provider: o.provider, link_source: o.source }
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 struct UpdateInfo {
     id: String,
@@ -280,6 +319,28 @@ async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
     Ok(rows)
 }
 
+#[tauri::command]
+async fn adoptable_addons(ctx: tauri::State<'_, Ctx>) -> Res<Vec<AdoptGroup>> {
+    Ok(adoptable(&*ctx.state.lock().await))
+}
+
+/// Start tracking folders that are already installed. Nothing is downloaded or moved.
+#[tauri::command]
+async fn adopt(ctx: tauri::State<'_, Ctx>, folders: Vec<String>) -> Res<TrackedAddon> {
+    if let Some(f) = folders.iter().find(|f| !installer::is_folder_name(f)) {
+        return Err(format!("{f:?} isn't an addon folder name"));
+    }
+    let mut st = ctx.state.lock().await;
+    if let Some(f) = folders.iter().find(|f| tracked_owner(&st, f).is_some()) {
+        return Err(format!("{f} is already tracked"));
+    }
+    let main = folders.iter().min_by_key(|f| f.len()).ok_or("No folders given")?;
+    let info = toc::read_info(&Path::new(&st.addons_dir).join(main)).ok_or_else(|| format!("{main} has no .toc"))?;
+    let o = origin_for(&st, &info);
+    let version = info.version.clone().unwrap_or_else(|| "unknown".into());
+    record(&mut st, o, version, folders).map_err(err)
+}
+
 /// Changes whenever a zip is added, removed or replaced in Downloads (as a string: u64 > JS number).
 #[tauri::command]
 async fn downloads_signature(ctx: tauri::State<'_, Ctx>) -> Res<String> {
@@ -491,6 +552,8 @@ fn main() {
             scan,
             scan_downloads,
             downloads_signature,
+            adoptable_addons,
+            adopt,
             install_local,
             install,
             link_addon,
