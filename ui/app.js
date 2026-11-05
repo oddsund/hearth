@@ -79,7 +79,9 @@ function render() {
     })
     .join("");
   // Downloads: show what can be installed/updated; just count the rest.
-  const actionable = dlRows.filter((r) => r.status !== "installed" && r.status !== "older");
+  const hidden = ["installed", "older", "other_game"];
+  const actionable = dlRows.filter((r) => !hidden.includes(r.status));
+  const otherGame = dlRows.filter((r) => r.status === "other_game").length;
   const label = { new: "Install", update: "Update", different: "Install" };
   $("dl-card").hidden = dlRows.length === 0;
   $("dl-count").textContent = actionable.length ? `(${actionable.length})` : "";
@@ -105,10 +107,13 @@ function render() {
       </tr>`;
     })
     .join("");
-  const done = dlRows.length - actionable.length;
-  $("dl-installed").textContent = !actionable.length
+  const done = dlRows.length - actionable.length - otherGame;
+  const notes = [];
+  if (done) notes.push(`${done} already installed`);
+  if (otherGame) notes.push(`${otherGame} for another game version (you have a build that fits)`);
+  $("dl-installed").textContent = !actionable.length && !otherGame
     ? "Everything in Downloads is already installed."
-    : done ? `${done} more already installed.` : "";
+    : notes.length ? `${actionable.length ? "Also: " : ""}${notes.join(", ")}.` : "";
   $("dl-installed").hidden = !$("dl-installed").textContent;
   actionableRows = actionable;
 

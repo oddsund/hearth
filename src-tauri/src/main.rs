@@ -48,7 +48,7 @@ struct UpdateInfo {
 struct DownloadRow {
     #[serde(flatten)]
     cand: downloads::Candidate,
-    /// "new" | "update" | "installed" | "older" | "different"
+    /// "new" | "update" | "installed" | "older" | "different" | "other_game"
     status: &'static str,
     installed_version: Option<String>,
     /// Where future updates will come from: "github" | "wowi" | "local"
@@ -89,6 +89,7 @@ fn addon_name(addons_dir: &Path, folders: &[String], source: &str) -> String {
 fn record(st: &mut AppState, o: Origin, version: String, folders: Vec<String>) -> anyhow::Result<TrackedAddon> {
     let id = o.id();
     let addons_dir = PathBuf::from(&st.addons_dir);
+    let curse_id = o.curse_id.clone().or_else(|| (o.provider == "curse").then(|| o.source.clone()));
     let addon = TrackedAddon {
         name: addon_name(&addons_dir, &folders, &o.source),
         id: id.clone(),
@@ -99,7 +100,7 @@ fn record(st: &mut AppState, o: Origin, version: String, folders: Vec<String>) -
         folders: folders.clone(),
         asset_pattern: o.asset_pattern,
         installed_at: installer::now(),
-        curse_id: o.curse_id,
+        curse_id,
     };
     for other in st.addons.iter_mut().filter(|a| a.id != id) {
         other.folders.retain(|f| !folders.iter().any(|n| n.eq_ignore_ascii_case(f)));
@@ -211,9 +212,17 @@ async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
             .into_iter()
             .map(|c| {
                 // Compare with what's actually on disk.
-                let installed_version = toc::read_info(&addons_dir.join(&c.main.folder))
-                    .map(|i| i.version.unwrap_or_else(|| "?".into()));
+                let installed = toc::read_info(&addons_dir.join(&c.main.folder));
+                let installed_version = installed.as_ref().map(|i| i.version.clone().unwrap_or_else(|| "?".into()));
+                let zip_fits = c.main.supports(&st.game_interface);
+                let tracked_online = tracked_owner(&st, &c.main.folder).is_some_and(|a| a.provider != "local");
+                // A zip for another game version is never an upgrade over a build that fits,
+                // nor over one Hearth keeps updated from an online source.
+                let other_game = zip_fits == Some(false)
+                    && installed.is_some()
+                    && (installed.as_ref().and_then(|i| i.supports(&st.game_interface)) == Some(true) || tracked_online);
                 let status = match (&installed_version, &c.main.version) {
+                    _ if other_game => "other_game",
                     (None, _) => "new",
                     (Some(iv), Some(cv)) if downloads::same_version(iv, cv) => "installed",
                     (Some(iv), Some(cv)) => match downloads::cmp_versions(cv, iv) {
@@ -226,7 +235,7 @@ async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
                 };
                 let o = origin_for(&st, &c.main);
                 DownloadRow {
-                    compatible: c.main.supports(&st.game_interface),
+                    compatible: zip_fits,
                     link_provider: o.provider,
                     link_source: o.source,
                     installed_version,
