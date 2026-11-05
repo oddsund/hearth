@@ -78,5 +78,7 @@ summary { cursor: pointer; color: var(--muted); }
   position: fixed; left: 0; right: 0; bottom: 0; padding: 9px 20px;
   background: var(--card); border-top: 1px solid var(--line); min-height: 38px;
   white-space: pre-wrap;
+  user-select: text;
+  word-break: break-all;
 }
 #status.error { color: var(--bad); }

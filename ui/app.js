@@ -131,7 +131,14 @@ document.addEventListener("click", (e) => {
   const a = e.target.closest("[data-open]");
   if (!a) return;
   e.preventDefault();
-  invoke("open_url", { url: a.dataset.open }).catch((err) => status(String(err), true));
+  const url = a.dataset.open;
+  invoke("open_url", { url }).catch((err) => {
+    // Fall back to showing the link so it can be copied into a browser by hand.
+    status(`${err}\nCopy this link into your browser instead:\n${url}`, true);
+    const s = window.getSelection(), r = document.createRange();
+    const node = $("status").firstChild;
+    if (node) { r.setStart(node, node.length - url.length); r.setEnd(node, node.length); s.removeAllRanges(); s.addRange(r); }
+  });
 });
 
 function render() {
