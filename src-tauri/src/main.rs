@@ -721,13 +721,81 @@ fn backup_location() -> String {
     state::data_dir().join("backup").to_string_lossy().into_owned()
 }
 
+/// One Hearth at a time: a second launch (e.g. the desktop shortcut while the startup copy runs)
+/// asks the first to show its window, then exits. Uses a Unix socket in the app data folder.
+#[cfg(unix)]
+mod single {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+
+    fn sock() -> PathBuf {
+        crate::state::data_dir().join("hearth.sock")
+    }
+
+    /// True if another Hearth answered (and was asked to show itself).
+    pub fn signal_existing() -> bool {
+        match UnixStream::connect(sock()) {
+            Ok(mut s) => s.write_all(b"show").is_ok(),
+            Err(_) => false, // none running, or a stale socket from a crash
+        }
+    }
+
+    pub fn listen(on_show: impl Fn() + Send + 'static) {
+        let p = sock();
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        let _ = std::fs::remove_file(&p);
+        if let Ok(listener) = UnixListener::bind(&p) {
+            std::thread::spawn(move || {
+                for mut s in listener.incoming().flatten() {
+                    let mut buf = [0u8; 8];
+                    let _ = s.read(&mut buf);
+                    on_show();
+                }
+            });
+        }
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    if single::signal_existing() {
+        return;
+    }
+
     let client = reqwest::Client::builder()
         .user_agent(concat!("hearth-addon-manager/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("http client");
 
     tauri::Builder::default()
+        .setup(|app| {
+            use tauri::Manager;
+            // Started at Windows login: run in the background (updates are still checked).
+            // Hidden, not minimized: under WSLg (Wayland) an app can't un-minimize itself,
+            // but it can show a hidden window.
+            if std::env::args().any(|a| a == "--minimized" || a == "--hidden") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            #[cfg(unix)]
+            {
+                let handle = app.handle().clone();
+                single::listen(move || {
+                    if let Some(w) = handle.get_webview_window("main") {
+                        // Re-mapping the window brings it back even if the user minimized it.
+                        if w.is_visible().unwrap_or(false) {
+                            let _ = w.hide();
+                        }
+                        let _ = w.show();
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                });
+            }
+            Ok(())
+        })
         .manage(Ctx { state: Mutex::new(AppState::load()), client })
         .invoke_handler(tauri::generate_handler![
             get_state,

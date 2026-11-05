@@ -20,6 +20,8 @@ wsl -d FedoraLinux-45 -u root -- bash /mnt/c/path/to/hearth/install.sh
 ```
 
 Start: the desktop shortcut runs `wslg.exe -d FedoraLinux-45 -u root -- /usr/local/bin/hearth`.
+A copy in the Windows Startup folder (`shell:startup`) adds `--hidden`, so Hearth runs in the
+background from login. Only one Hearth runs at a time; launching it again shows the window.
 Dev run without installing: `run.sh`.
 
 ## Tests
