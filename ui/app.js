@@ -281,7 +281,7 @@ function render() {
   $("empty").hidden = state.addons.length > 0;
   $("count").textContent = state.addons.length ? `(${state.addons.length})` : "";
 
-  for (const id of ["btn-check", "btn-save", "btn-rescan", "btn-adopt-all", "btn-wtf-now"]) $(id).disabled = busy;
+  for (const id of ["btn-check", "btn-save", "btn-rescan", "btn-adopt-all", "btn-wtf-now", "btn-export", "btn-import"]) $(id).disabled = busy;
   const pending = Object.values(updates).filter((u) => u.has_update && !jobs.has("up:" + u.id)).length;
   $("btn-update-all").disabled = busy || !pending;
   $("btn-update-all").textContent = pending ? `Update all (${pending})` : "Update all";
@@ -460,6 +460,33 @@ $("untracked").onclick = (e) => {
   if (i !== undefined) run("Tracking", () => adoptGroupsNow([adoptGroups[Number(i)]])).then(autoCheck);
 };
 $("btn-adopt-all").onclick = () => run("Tracking", () => adoptGroupsNow([...adoptGroups])).then(autoCheck);
+
+$("btn-export").onclick = () =>
+  run("Exporting", async () => {
+    const path = await invoke("export_list");
+    status(`Saved ${state.addons.length} addon${state.addons.length === 1 ? "" : "s"} to ${path}`);
+  });
+
+$("btn-import").onclick = () =>
+  run("Reading hearth-addons.json", async () => {
+    const entries = await invoke("import_list");
+    const online = entries.filter((e) => e.provider !== "local");
+    const manual = entries.filter((e) => e.provider === "local");
+    if (!entries.length) return status("You already have every addon in hearth-addons.json.");
+    if (online.length && !confirm(`Install ${online.length} addon${online.length === 1 ? "" : "s"} from hearth-addons.json?\n\n${online.map((e) => e.name).join("\n")}`))
+      return status("Import cancelled.");
+    for (const e of online) {
+      enqueue("url:" + e.provider + ":" + e.source, e.name, async () => {
+        const a = await invoke("install", { url: sourceUrl(e.provider, e.source), assetPattern: e.asset_pattern ?? null });
+        if (e.pinned) await invoke("set_pinned", { id: a.id, pinned: true });
+        return `${a.name} ${a.version}${e.pinned ? " (pinned)" : ""}`;
+      });
+    }
+    status(
+      (online.length ? `Queued ${online.length} install${online.length === 1 ? "" : "s"}.` : "") +
+        (manual.length ? `\nInstall these by hand (no online source): ${manual.map((e) => e.name).join(", ")}` : "")
+    );
+  });
 
 $("btn-clean").onclick = () => {
   const paths = [...cleanable];

@@ -566,6 +566,73 @@ async fn set_pinned(ctx: tauri::State<'_, Ctx>, id: String, pinned: bool) -> Res
     Ok(out)
 }
 
+const LIST_FILE: &str = "hearth-addons.json";
+
+#[derive(Serialize, serde::Deserialize, Clone)]
+struct ListEntry {
+    name: String,
+    provider: String,
+    source: String,
+    url: String,
+    #[serde(default)]
+    asset_pattern: Option<String>,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    version: String,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct AddonList {
+    hearth: u32,
+    exported_at: u64,
+    addons: Vec<ListEntry>,
+}
+
+/// Write the tracked addons to <Downloads>/hearth-addons.json. Returns the file path.
+#[tauri::command]
+async fn export_list(ctx: tauri::State<'_, Ctx>) -> Res<String> {
+    let st = ctx.state.lock().await;
+    if st.downloads_dir.is_empty() {
+        return Err("Set a Downloads folder in Settings first".into());
+    }
+    let list = AddonList {
+        hearth: 1,
+        exported_at: installer::now(),
+        addons: st
+            .addons
+            .iter()
+            .map(|a| ListEntry {
+                name: a.name.clone(),
+                provider: a.provider.clone(),
+                source: a.source.clone(),
+                url: a.url.clone(),
+                asset_pattern: a.asset_pattern.clone(),
+                pinned: a.pinned,
+                version: a.version.clone(),
+            })
+            .collect(),
+    };
+    let path = Path::new(&st.downloads_dir).join(LIST_FILE);
+    std::fs::write(&path, serde_json::to_vec_pretty(&list).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("Writing {}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Entries of <Downloads>/hearth-addons.json that aren't tracked here yet.
+#[tauri::command]
+async fn import_list(ctx: tauri::State<'_, Ctx>) -> Res<Vec<ListEntry>> {
+    let st = ctx.state.lock().await;
+    let path = Path::new(&st.downloads_dir).join(LIST_FILE);
+    let bytes = std::fs::read(&path).map_err(|_| format!("Put {LIST_FILE} (from Export on your other PC) in {} first", st.downloads_dir))?;
+    let list: AddonList = serde_json::from_slice(&bytes).map_err(|e| format!("{LIST_FILE} isn't a Hearth addon list: {e}"))?;
+    Ok(list
+        .addons
+        .into_iter()
+        .filter(|e| !st.addons.iter().any(|a| a.provider == e.provider && a.source == e.source))
+        .collect())
+}
+
 /// Release notes for the version an update would install.
 #[tauri::command]
 async fn changelog(ctx: tauri::State<'_, Ctx>, id: String) -> Res<String> {
@@ -682,6 +749,8 @@ fn main() {
             roll_back,
             wow_running,
             set_pinned,
+            export_list,
+            import_list,
             changelog,
             settings_backups,
             backup_settings_now,

@@ -211,6 +211,19 @@ fn wsl_paths_to_windows() {
 }
 
 #[test]
+fn addon_list_round_trip() {
+    let json = r#"{"hearth":1,"exported_at":1,"addons":[
+        {"name":"Leatrix Maps","provider":"curse","source":"298842","url":"https://www.curseforge.com/projects/298842","pinned":true},
+        {"name":"Foo","provider":"local","source":"Foo","url":""}]}"#;
+    let list: crate::AddonList = serde_json::from_str(json).unwrap();
+    assert_eq!(list.addons.len(), 2);
+    assert!(list.addons[0].pinned && !list.addons[1].pinned, "missing fields default");
+    assert_eq!(list.addons[1].asset_pattern, None);
+    let again: crate::AddonList = serde_json::from_slice(&serde_json::to_vec(&list).unwrap()).unwrap();
+    assert_eq!(again.addons[0].source, "298842");
+}
+
+#[test]
 fn changelog_html_to_text() {
     let t = providers::html_to_text("<p>\u{feff}1.2 - Today</p>\n<ul>\n<li>Fixed &amp; improved</li><li>New <b>thing</b></li></ul>");
     assert_eq!(t, "1.2 - Today\n\n• Fixed & improved\n• New thing");
