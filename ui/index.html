@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hearth</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Hearth</h1>
+    <div class="actions">
+      <button id="btn-check">Check for updates</button>
+      <button id="btn-update-all" class="primary" disabled>Update all</button>
+      <button id="btn-settings" class="ghost" title="Settings">Settings</button>
+    </div>
+  </header>
+
+  <section id="settings" class="card" hidden>
+    <h2>Settings</h2>
+    <label>AddOns folder
+      <input id="in-dir" spellcheck="false" placeholder="C:\Program Files (x86)\World of Warcraft\_forever_\Interface\AddOns">
+    </label>
+    <label>Downloads folder <span class="muted">(where Hearth looks for addon zips you downloaded)</span>
+      <input id="in-dl" spellcheck="false">
+    </label>
+    <label>Game interface version <span class="muted">(warns about zips not made for your game; 16001 = _forever_; leave empty to skip)</span>
+      <input id="in-iface" spellcheck="false" placeholder="16001">
+    </label>
+    <label>GitHub token <span class="muted">(optional — raises the rate limit from 60 to 5000 requests/hour; no scopes needed)</span>
+      <input id="in-token" type="password" spellcheck="false" placeholder="github_pat_…">
+    </label>
+    <div class="row">
+      <button id="btn-save" class="primary">Save</button>
+      <span class="muted" id="backup-loc"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Install</h2>
+    <div class="row">
+      <input id="in-url" spellcheck="false" placeholder="GitHub URL, owner/repo, or WoWInterface URL">
+      <button id="btn-install" class="primary">Install</button>
+    </div>
+    <details>
+      <summary>Advanced</summary>
+      <label>Asset pattern <span class="muted">(regex for picking a specific zip from a GitHub release, e.g. <code>-forever</code> or <code>^ElvUI-\d</code>)</span>
+        <input id="in-pattern" spellcheck="false">
+      </label>
+    </details>
+  </section>
+
+  <section class="card" id="dl-card" hidden>
+    <div class="card-head">
+      <h2>Found in Downloads <span class="muted" id="dl-count"></span></h2>
+      <button id="btn-rescan" class="small ghost">Rescan</button>
+    </div>
+    <table>
+      <thead><tr><th>Addon</th><th>Zip</th><th>Version</th><th>Updates from</th><th></th></tr></thead>
+      <tbody id="downloads"></tbody>
+    </table>
+    <p id="dl-installed" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>Installed <span class="muted" id="count"></span></h2>
+    <table>
+      <thead><tr><th>Addon</th><th>Source</th><th>Version</th><th>Latest</th><th></th></tr></thead>
+      <tbody id="tracked"></tbody>
+    </table>
+    <p id="empty" class="muted" hidden>Nothing installed with Hearth yet. Paste a URL above.</p>
+  </section>
+
+  <section class="card" id="untracked-card" hidden>
+    <h2>Other folders in AddOns <span class="muted">(not managed by Hearth)</span></h2>
+    <table>
+      <thead><tr><th>Folder</th><th>Title</th><th>Version</th><th>Known ids</th></tr></thead>
+      <tbody id="untracked"></tbody>
+    </table>
+  </section>
+
+  <div id="status" role="status"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

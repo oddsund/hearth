@@ -1,0 +1,5 @@
+* text=auto
+# Run inside WSL; CRLF breaks bash.
+*.sh text eol=lf
+*.png binary
+*.ico binary
