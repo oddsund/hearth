@@ -354,6 +354,30 @@ async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
     Ok(())
 }
 
+/// Open a web page in the user's normal (Windows) browser. Only for the addon sites Hearth links to.
+#[tauri::command]
+fn open_url(url: String) -> Res<()> {
+    const ALLOWED: [&str; 4] = [
+        "https://www.curseforge.com/",
+        "https://www.wowinterface.com/",
+        "https://github.com/",
+        "https://duckduckgo.com/",
+    ];
+    if !ALLOWED.iter().any(|p| url.starts_with(p)) || url.chars().any(|c| c.is_whitespace() || c == '"') {
+        return Err(format!("Not opening {url}"));
+    }
+    let spawn = if cfg!(windows) {
+        std::process::Command::new("explorer.exe").arg(&url).spawn()
+    } else if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        // Under WSL, hand the URL to Windows so it opens in the user's own browser.
+        std::process::Command::new("/mnt/c/Windows/explorer.exe").arg(&url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&url).spawn()
+    };
+    // explorer.exe exits non-zero even on success, so only a failure to start counts.
+    spawn.map(|_| ()).map_err(|e| format!("Couldn't open the browser: {e}"))
+}
+
 #[tauri::command]
 fn backup_location() -> String {
     state::data_dir().join("backup").to_string_lossy().into_owned()
@@ -378,6 +402,7 @@ fn main() {
             check_updates,
             update_addon,
             uninstall,
+            open_url,
             backup_location
         ])
         .run(tauri::generate_context!())

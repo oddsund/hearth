@@ -100,11 +100,24 @@ function jobButton(key, attrs, label, cls = "") {
   return `<button class="small ${cls}" ${attrs}>${label}</button>`;
 }
 
+// Opens in the user's own browser via the backend (allow-listed sites only).
+const extLink = (url, text) => `<a href="#" class="ext" data-open="${esc(url)}">${esc(text)}</a>`;
+
+/** Where to find the CurseForge Project ID: the page itself if we know it, else a search. */
+function findIdLinks(a) {
+  if (a.curse_id) return extLink(`https://www.curseforge.com/projects/${encodeURIComponent(a.curse_id)}`, `Open ${a.name} on CurseForge ↗`);
+  const q = encodeURIComponent(a.name);
+  const web = encodeURIComponent(`${a.name} ${a.folders[0] ?? ""} site:curseforge.com/wow`);
+  return `${extLink(`https://www.curseforge.com/wow/search?class=addons&search=${q}`, `Search CurseForge for “${a.name}” ↗`)}
+    <span class="muted">·</span> ${extLink(`https://duckduckgo.com/?q=${web}`, "or search the web ↗")}`;
+}
+
 function linkRow(a) {
   const hint = a.curse_id
     ? `This zip names CurseForge project <code>${esc(a.curse_id)}</code>.`
-    : `On the addon's CurseForge page, the Project ID is in the "About Project" box.`;
+    : `Open the addon's page and copy the <strong>Project ID</strong> from the "About Project" box.`;
   return `<tr class="link-row"><td colspan="5">
+    <div class="link-find">${findIdLinks(a)}</div>
     <div class="row">
       <input id="in-link" spellcheck="false" placeholder="CurseForge project ID, GitHub URL, or WoWInterface URL" value="${esc(a.curse_id ?? "")}">
       <button class="small primary" data-link-go="${esc(a.id)}">Link &amp; update</button>
@@ -113,6 +126,13 @@ function linkRow(a) {
     <div class="folders">${hint} Hearth then installs the newest build for your game from there and keeps it updated.</div>
   </td></tr>`;
 }
+
+document.addEventListener("click", (e) => {
+  const a = e.target.closest("[data-open]");
+  if (!a) return;
+  e.preventDefault();
+  invoke("open_url", { url: a.dataset.open }).catch((err) => status(String(err), true));
+});
 
 function render() {
   const tb = $("tracked");
@@ -127,7 +147,7 @@ function render() {
       const src = sourceLabel(a.provider, a.source);
       return `<tr>
         <td><strong>${esc(a.name)}</strong><div class="folders">${a.folders.map(esc).join(", ")}</div></td>
-        <td><span title="${esc(a.url)}">${esc(src)}</span>${a.asset_pattern ? `<div class="folders">pattern: <code>${esc(a.asset_pattern)}</code></div>` : ""}</td>
+        <td>${a.url ? extLink(a.url, src) : esc(src)}${a.asset_pattern ? `<div class="folders">pattern: <code>${esc(a.asset_pattern)}</code></div>` : ""}</td>
         <td>${esc(a.version)}</td>
         <td>${latest}</td>
         <td class="actions-cell">

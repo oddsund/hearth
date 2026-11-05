@@ -65,6 +65,9 @@ td.actions-cell { text-align: right; white-space: nowrap; }
 .new { color: var(--ok); font-weight: 600; }
 .warn { color: var(--bad); font-size: 12px; }
 tr.link-row td { background: var(--bg); }
+.link-find { margin-bottom: 8px; font-weight: 600; }
+a.ext { color: var(--accent); text-decoration: none; }
+a.ext:hover { text-decoration: underline; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }
 .card-head h2 { margin-bottom: 10px; }
 .bad { color: var(--bad); }
