@@ -22,6 +22,27 @@ impl GameInfo {
     }
 }
 
+/// Is a WoW client running? None if we can't tell (not on Windows/WSL, or tasklist failed).
+pub fn wow_running() -> Option<bool> {
+    const CLIENTS: [&str; 5] = ["wow.exe", "wowclassic.exe", "wow-64.exe", "wowb.exe", "wowt.exe"];
+    let exe = if cfg!(windows) {
+        "tasklist.exe"
+    } else if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        "/mnt/c/Windows/System32/tasklist.exe"
+    } else {
+        return None;
+    };
+    let out = std::process::Command::new(exe).args(["/FO", "CSV", "/NH"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    Some(text.lines().any(|l| {
+        let name = l.trim().trim_start_matches('"').split('"').next().unwrap_or("");
+        CLIENTS.contains(&name)
+    }))
+}
+
 pub fn detect(addons_dir: &Path) -> GameInfo {
     let Some(flavor_dir) = addons_dir.parent().and_then(|p| p.parent()) else {
         return GameInfo::default();

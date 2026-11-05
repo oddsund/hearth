@@ -49,10 +49,39 @@ const queue = [];
 let running = 0;
 let results = []; // finished since the queue was last empty
 
+// Changing addons while WoW runs can fail on open files, and the game keeps the old code
+// until /reload. Ask once per batch; after a "yes", don't ask again for a while.
+let wowOkUntil = 0;
+let wowGatePending = null; // clicks during a check share its answer (one prompt, not several)
+function wowGate() {
+  if (Date.now() < wowOkUntil) return Promise.resolve(true);
+  return (wowGatePending ??= askWowGate().finally(() => (wowGatePending = null)));
+}
+async function askWowGate() {
+  let isRunning = null;
+  try { isRunning = await invoke("wow_running"); } catch (_) {}
+  if (!isRunning) {
+    wowOkUntil = Date.now() + 15_000; // re-check soon; it's cheap
+    return true;
+  }
+  const ok = confirm(
+    "World of Warcraft is running.\n\nChanging addons now can fail on files the game has open, " +
+      "and the game keeps using the old versions until you /reload or restart it.\n\nContinue anyway?"
+  );
+  if (ok) wowOkUntil = Date.now() + 5 * 60_000;
+  return ok;
+}
+
 /** fn resolves to a success message. Keys stop the same thing being queued twice. */
-function enqueue(key, label, fn) {
+async function enqueue(key, label, fn) {
   if (jobs.has(key)) return;
   jobs.set(key, "queued");
+  render();
+  if (!(await wowGate())) {
+    jobs.delete(key);
+    render();
+    return status("Cancelled: WoW is running.");
+  }
   queue.push({ key, label, fn });
   pump();
   render();
@@ -387,6 +416,7 @@ $("tracked").onclick = (e) => {
     const a = state.addons.find((x) => x.id === rm);
     if (!confirm(`Remove ${a?.name}? Its folders are moved to the backup folder, not deleted.`)) return;
     run("Removing " + rm, async () => {
+      if (!(await wowGate())) return status("Cancelled: WoW is running.");
       await invoke("uninstall", { id: rm });
       delete updates[rm];
       await refresh();

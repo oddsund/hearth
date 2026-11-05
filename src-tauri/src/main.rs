@@ -366,6 +366,12 @@ async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
     Ok(())
 }
 
+/// Is WoW running? null when it can't be checked.
+#[tauri::command]
+async fn wow_running() -> Res<Option<bool>> {
+    tauri::async_runtime::spawn_blocking(game::wow_running).await.map_err(|e| e.to_string())
+}
+
 /// For each tracked addon with a backup: the version it would roll back to ("" if unknown).
 #[tauri::command]
 async fn rollback_options(ctx: tauri::State<'_, Ctx>) -> Res<std::collections::HashMap<String, String>> {
@@ -447,6 +453,7 @@ fn main() {
             uninstall,
             rollback_options,
             roll_back,
+            wow_running,
             open_url,
             backup_location
         ])

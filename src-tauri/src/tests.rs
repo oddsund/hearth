@@ -194,6 +194,15 @@ async fn curseforge_forever_build() {
     install_into_temp("curse", "298842").await;
 }
 
+/// Asks Windows whether WoW runs (read-only).
+#[test]
+#[ignore]
+fn real_wow_running() {
+    let r = crate::game::wow_running();
+    println!("wow running: {r:?}");
+    assert!(r.is_some(), "tasklist should be reachable");
+}
+
 /// Reads the real WoW install (read-only).
 #[test]
 #[ignore]
