@@ -210,7 +210,10 @@ function render() {
   $("count").textContent = state.addons.length ? `(${state.addons.length})` : "";
 
   for (const id of ["btn-check", "btn-save", "btn-rescan"]) $(id).disabled = busy;
-  $("btn-update-all").disabled = busy || !Object.values(updates).some((u) => u.has_update && !jobs.has("up:" + u.id));
+  const pending = Object.values(updates).filter((u) => u.has_update && !jobs.has("up:" + u.id)).length;
+  $("btn-update-all").disabled = busy || !pending;
+  $("btn-update-all").textContent = pending ? `Update all (${pending})` : "Update all";
+  $("btn-check").textContent = checking ? "Checking…" : "Check for updates";
   $("btn-install").disabled = jobs.has("url:" + $("in-url").value.trim());
 }
 
@@ -270,18 +273,36 @@ $("btn-install").onclick = () => {
 };
 $("in-url").addEventListener("keydown", (e) => e.key === "Enter" && $("btn-install").click());
 
-$("btn-check").onclick = () =>
-  run("Checking for updates", async () => {
-    const list = await invoke("check_updates");
-    updates = Object.fromEntries(list.map((u) => [u.id, u]));
-    const n = list.filter((u) => u.has_update).length;
-    const errs = list.filter((u) => u.error);
-    status(
-      (n ? `${n} update${n > 1 ? "s" : ""} available.` : "Everything is up to date.") +
-        (errs.length ? `\n${errs.length} failed: ${errs.map((e) => e.id + " – " + e.error).join("; ")}` : ""),
-      errs.length > 0
-    );
-  });
+/** quiet: background check (startup/timer) — don't interrupt a running queue's status. */
+let checking = false;
+async function checkUpdates(quiet = false) {
+  checking = true;
+  render();
+  let list;
+  try { list = await invoke("check_updates"); } finally { checking = false; }
+  updates = Object.fromEntries(list.map((u) => [u.id, u]));
+  const n = list.filter((u) => u.has_update).length;
+  const errs = list.filter((u) => u.error);
+  render();
+  if (quiet && (running || queue.length)) return;
+  if (quiet && !n && !errs.length) return status("Ready. Everything is up to date.");
+  status(
+    (n ? `${n} update${n > 1 ? "s" : ""} available.` : "Everything is up to date.") +
+      (errs.length ? `\n${errs.length} failed: ${errs.map((e) => e.id + " – " + e.error).join("; ")}` : ""),
+    errs.length > 0
+  );
+}
+
+$("btn-check").onclick = () => run("Checking for updates", () => checkUpdates());
+
+const RECHECK_MS = 6 * 60 * 60 * 1000;
+async function autoCheck() {
+  if (busy || !state.addons.some((a) => a.provider !== "local")) return;
+  busy = true;
+  render();
+  try { await checkUpdates(true); } catch (_) {} finally { busy = false; render(); }
+}
+setInterval(autoCheck, RECHECK_MS);
 
 function enqueueUpdate(id) {
   const name = state.addons.find((a) => a.id === id)?.name ?? id;
@@ -364,6 +385,7 @@ $("tracked").onclick = (e) => {
     $("backup-loc").textContent = "Backups: " + (await invoke("backup_location"));
     await refresh();
     if (state.addons_dir) status("Ready. AddOns: " + state.addons_dir);
+    await autoCheck();
   } catch (e) {
     status(String(e), true);
   }
