@@ -21,6 +21,8 @@ pub struct Candidate {
     pub folders: Vec<String>,
     /// Toc info of the main folder.
     pub main: TocInfo,
+    /// Other zips in the folder with the same addon and version (e.g. "Foo(1).zip").
+    pub duplicates: Vec<String>,
 }
 
 /// Look inside a zip: which addon folders does it contain, and what does the main toc say?
@@ -99,17 +101,24 @@ pub fn scan(dir: &Path) -> Vec<Candidate> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let c = Candidate {
+        let mut c = Candidate {
             file_name: e.file_name().to_string_lossy().into_owned(),
             path: path.to_string_lossy().into_owned(),
             modified,
             folders,
             main,
+            duplicates: vec![],
         };
         let key = (c.main.folder.to_lowercase(), c.main.version.clone().unwrap_or_default());
-        match seen.get(&key) {
-            Some(old) if old.modified >= c.modified => {}
-            _ => {
+        match seen.get_mut(&key) {
+            // Keep the newest copy; remember the others so clean-up can take them too.
+            Some(old) if old.modified >= c.modified => old.duplicates.push(c.path),
+            Some(old) => {
+                c.duplicates = std::mem::take(&mut old.duplicates);
+                c.duplicates.push(old.path.clone());
+                *old = c;
+            }
+            None => {
                 seen.insert(key, c);
             }
         }

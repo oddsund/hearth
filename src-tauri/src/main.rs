@@ -6,6 +6,7 @@ mod installer;
 mod providers;
 mod state;
 mod toc;
+mod trash;
 mod wtf;
 #[cfg(test)]
 mod tests;
@@ -398,6 +399,27 @@ async fn adopt(ctx: tauri::State<'_, Ctx>, folders: Vec<String>) -> Res<TrackedA
     record(&mut st, o, version, folders).map_err(err)
 }
 
+/// Move zips from the Downloads folder to the Recycle Bin. Only .zip files directly in Downloads.
+#[tauri::command]
+async fn recycle_zips(ctx: tauri::State<'_, Ctx>, paths: Vec<String>) -> Res<usize> {
+    let dl = PathBuf::from(&ctx.state.lock().await.downloads_dir);
+    let mut ok: Vec<PathBuf> = Vec::new();
+    for p in paths.iter().map(PathBuf::from) {
+        let in_downloads = !dl.as_os_str().is_empty() && p.parent() == Some(dl.as_path());
+        let is_zip = p.extension().map(|x| x.eq_ignore_ascii_case("zip")).unwrap_or(false);
+        if !in_downloads || !is_zip || !p.is_file() {
+            return Err(format!("Not touching {}", p.display()));
+        }
+        ok.push(p);
+    }
+    let n = ok.len();
+    tauri::async_runtime::spawn_blocking(move || trash::recycle(&ok.iter().map(|p| p.as_path()).collect::<Vec<_>>()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)?;
+    Ok(n)
+}
+
 /// Changes whenever a zip is added, removed or replaced in Downloads (as a string: u64 > JS number).
 #[tauri::command]
 async fn downloads_signature(ctx: tauri::State<'_, Ctx>) -> Res<String> {
@@ -646,6 +668,7 @@ fn main() {
             scan,
             scan_downloads,
             downloads_signature,
+            recycle_zips,
             adoptable_addons,
             adopt,
             missing_dependencies,

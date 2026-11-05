@@ -97,6 +97,8 @@ fn local_zip_discovery_and_install() {
     std::fs::remove_file(dl.path().join("notes.zip")).unwrap();
     assert_ne!(sig, crate::downloads::signature(dl.path()), "changes when a zip goes away");
     let c = &found[0];
+    assert_eq!(c.duplicates.len(), 1, "the (1) copy is remembered for clean-up");
+    assert_ne!(c.duplicates[0], c.path);
     assert_eq!(c.folders, vec!["Foo", "Foo_Options"]);
     assert_eq!(c.main.title, "Foo");
     assert_eq!(c.main.github.as_deref(), Some("someone/Foo"));
@@ -198,6 +200,16 @@ async fn curseforge_forever_build() {
     install_into_temp("curse", "298842").await;
 }
 
+#[cfg(not(windows))]
+#[test]
+fn wsl_paths_to_windows() {
+    use std::path::Path;
+    assert_eq!(crate::trash::windows_path(Path::new("/mnt/c/Users/x/Downloads/a b.zip")).as_deref(), Some(r"C:\Users\x\Downloads\a b.zip"));
+    assert_eq!(crate::trash::windows_path(Path::new("/mnt/d")).as_deref(), Some("D:"));
+    assert_eq!(crate::trash::windows_path(Path::new("/root/a.zip")), None);
+    assert_eq!(crate::trash::windows_path(Path::new("/mnt/cc/a.zip")), None);
+}
+
 #[test]
 fn changelog_html_to_text() {
     let t = providers::html_to_text("<p>\u{feff}1.2 - Today</p>\n<ul>\n<li>Fixed &amp; improved</li><li>New <b>thing</b></li></ul>");
@@ -237,7 +249,7 @@ fn finds_missing_dependencies() {
     };
     let zip = crate::downloads::Candidate {
         path: "/dl/LibThing.zip".into(), file_name: "LibThing.zip".into(), modified: 0,
-        folders: vec!["LibThing".into()], main: Default::default(),
+        folders: vec!["LibThing".into()], main: Default::default(), duplicates: vec![],
     };
     let r = crate::missing_deps(&st, &[zip]);
     assert_eq!(r.len(), 1);

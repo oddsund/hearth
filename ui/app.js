@@ -7,6 +7,7 @@ let dlRows = []; // zips found in Downloads
 let rollbacks = {}; // id -> version a roll back would restore ("" = unknown)
 let adoptGroups = []; // hand-installed addons Hearth could start tracking
 let missingDeps = {}; // id -> [{folder, zip_path, zip_file}]
+let cleanable = []; // zip paths in Downloads that are installed already
 let notesOpen = null; // id whose "What's new" is expanded
 const notes = {}; // id -> text | null while loading
 
@@ -270,6 +271,12 @@ function render() {
     : notes.length ? `${actionable.length ? "Also: " : ""}${notes.join(", ")}.` : "";
   $("dl-installed").hidden = !$("dl-installed").textContent;
   actionableRows = actionable;
+  // Zips that are no longer needed: installed (same or newer), or for another game version.
+  cleanable = dlRows.filter((r) => hidden.includes(r.status)).flatMap((r) => [r.path, ...r.duplicates])
+    .concat(actionable.flatMap((r) => r.duplicates));
+  $("btn-clean").hidden = !cleanable.length;
+  $("btn-clean").disabled = busy;
+  $("btn-clean").textContent = `Move ${cleanable.length} installed zip${cleanable.length === 1 ? "" : "s"} to the Recycle Bin`;
 
   $("empty").hidden = state.addons.length > 0;
   $("count").textContent = state.addons.length ? `(${state.addons.length})` : "";
@@ -454,7 +461,18 @@ $("untracked").onclick = (e) => {
 };
 $("btn-adopt-all").onclick = () => run("Tracking", () => adoptGroupsNow([...adoptGroups])).then(autoCheck);
 
-$("btn-rescan").onclick =() => run("Scanning Downloads", async () => { await refresh(); status("Rescanned Downloads."); });
+$("btn-clean").onclick = () => {
+  const paths = [...cleanable];
+  const names = paths.map((p) => p.split("/").pop());
+  if (!confirm(`Move these ${paths.length} zips to the Recycle Bin?\n\n${names.join("\n")}\n\nTheir addons stay installed. You can restore the zips from the Recycle Bin.`)) return;
+  run("Cleaning up Downloads", async () => {
+    const n = await invoke("recycle_zips", { paths });
+    await refresh();
+    status(`Moved ${n} zip${n === 1 ? "" : "s"} to the Recycle Bin.`);
+  });
+};
+
+$("btn-rescan").onclick = () => run("Scanning Downloads", async () => { await refresh(); status("Rescanned Downloads."); });
 
 const sourceUrl = (provider, source) =>
   provider === "wowi" ? `https://www.wowinterface.com/downloads/info${source}` : source; // github: owner/repo, curse: id
