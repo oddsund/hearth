@@ -366,15 +366,20 @@ fn open_url(url: String) -> Res<()> {
     if !ALLOWED.iter().any(|p| url.starts_with(p)) || url.chars().any(|c| c.is_whitespace() || c == '"') {
         return Err(format!("Not opening {url}"));
     }
-    let spawn = if cfg!(windows) {
-        std::process::Command::new("explorer.exe").arg(&url).spawn()
+    // url.dll's FileProtocolHandler hands the URL to the default browser. (explorer.exe
+    // misreads URLs with a query string and opens a File Explorer window instead.)
+    let rundll = if cfg!(windows) {
+        Some("rundll32.exe")
     } else if std::env::var_os("WSL_DISTRO_NAME").is_some() {
         // Under WSL, hand the URL to Windows so it opens in the user's own browser.
-        std::process::Command::new("/mnt/c/Windows/explorer.exe").arg(&url).spawn()
+        Some("/mnt/c/Windows/System32/rundll32.exe")
     } else {
-        std::process::Command::new("xdg-open").arg(&url).spawn()
+        None
     };
-    // explorer.exe exits non-zero even on success, so only a failure to start counts.
+    let spawn = match rundll {
+        Some(exe) => std::process::Command::new(exe).args(["url.dll,FileProtocolHandler", &url]).spawn(),
+        None => std::process::Command::new("xdg-open").arg(&url).spawn(),
+    };
     spawn.map(|_| ()).map_err(|e| format!("Couldn't open the browser: {e}"))
 }
 
