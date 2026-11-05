@@ -202,6 +202,9 @@ function render() {
       const u = updates[a.id];
       let latest = '<span class="muted">–</span>';
       if (a.provider === "local") latest = '<span class="muted" title="No online source known. Download a newer zip to update.">manual</span>';
+      else if (a.pinned)
+        latest = `<span class="muted" title="Pinned: update checks and Update all skip this addon">pinned</span>${
+          u?.latest && u.latest !== a.version ? `<div class="folders">latest ${esc(u.latest)}</div>` : ""}`;
       else if (u?.error) latest = `<span class="bad" title="${esc(u.error)}">error</span>`;
       else if (u?.has_update)
         latest = `<span class="new">${esc(u.latest)}</span><div><a href="#" class="ext" data-notes="${esc(a.id)}">${notesOpen === a.id ? "Hide" : "What's new"}</a></div>`;
@@ -215,7 +218,10 @@ function render() {
         <td class="actions-cell">
           ${a.provider === "local"
             ? jobButton("ln:" + a.id, `data-link="${esc(a.id)}"`, "Link", "primary")
-            : jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "")}
+            : a.pinned
+              ? `<button class="small" data-pin="${esc(a.id)}" data-pin-to="0">Unpin</button>`
+              : jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "") +
+                ` <button class="small ghost" data-pin="${esc(a.id)}" data-pin-to="1" title="Stay on ${esc(a.version)}: skip this addon when checking for and installing updates">Pin</button>`}
           ${a.id in rollbacks
             ? jobButton("rb:" + a.id, `data-rollback="${esc(a.id)}" title="Swap back to the version Hearth replaced. You can roll forward again the same way."`,
                 rollbacks[a.id] ? `Roll back to ${esc(rollbacks[a.id])}` : "Roll back", "ghost")
@@ -478,6 +484,17 @@ $("tracked").onclick = (e) => {
   const rm = e.target.closest("[data-remove]")?.dataset.remove;
   const ln = e.target.closest("[data-link]")?.dataset.link;
   const go = e.target.closest("[data-link-go]")?.dataset.linkGo;
+  const pin = e.target.closest("[data-pin]");
+  if (pin) {
+    const id = pin.dataset.pin, pinned = pin.dataset.pinTo === "1";
+    return invoke("set_pinned", { id, pinned })
+      .then(async (a) => {
+        if (updates[id]) updates[id].has_update = !pinned && !!updates[id].latest && updates[id].latest !== a.version;
+        await refresh();
+        status(pinned ? `${a.name} stays on ${a.version} until you unpin it.` : `${a.name} gets updates again.`);
+      })
+      .catch((err) => status(String(err), true));
+  }
   const nt = e.target.closest("[data-notes]")?.dataset.notes;
   if (nt) {
     e.preventDefault();
@@ -527,7 +544,7 @@ $("tracked").onclick = (e) => {
     enqueue("rb:" + rb, name, async () => {
       const a = await invoke("roll_back", { id: rb });
       delete updates[rb];
-      return `${a.name} rolled back to ${a.version}`;
+      return `${a.name} rolled back to ${a.version}${a.pinned ? "" : " (Pin it to keep updates from replacing it)"}`;
     });
   }
   if (rm) {

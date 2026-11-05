@@ -228,7 +228,7 @@ fn finds_missing_dependencies() {
     let tracked = |id: &str, folders: &[&str]| crate::state::TrackedAddon {
         id: id.into(), name: id.into(), provider: "local".into(), source: id.into(), url: String::new(),
         version: "1".into(), folders: folders.iter().map(|s| s.to_string()).collect(),
-        asset_pattern: None, installed_at: 0, curse_id: None,
+        asset_pattern: None, installed_at: 0, curse_id: None, pinned: false,
     };
     let st = crate::state::AppState {
         addons_dir: dir.path().to_string_lossy().into(),

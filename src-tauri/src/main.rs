@@ -130,6 +130,8 @@ struct UpdateInfo {
     has_update: bool,
     /// Installed from a zip with no known online source.
     manual: bool,
+    /// Pinned: `latest` is shown, but it isn't offered as an update.
+    pinned: bool,
     error: Option<String>,
 }
 
@@ -179,7 +181,9 @@ fn record(st: &mut AppState, o: Origin, version: String, folders: Vec<String>) -
     let id = o.id();
     let addons_dir = PathBuf::from(&st.addons_dir);
     let curse_id = o.curse_id.clone().or_else(|| (o.provider == "curse").then(|| o.source.clone()));
+    let pinned = st.addons.iter().any(|a| a.id == id && a.pinned);
     let addon = TrackedAddon {
+        pinned,
         name: addon_name(&addons_dir, &folders, &o.source),
         id: id.clone(),
         provider: o.provider,
@@ -458,21 +462,27 @@ async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
     let game = game::detect(Path::new(&st.addons_dir));
     let mut out = Vec::new();
     for a in &st.addons {
-        if a.provider == "local" {
-            out.push(UpdateInfo { id: a.id.clone(), current: a.version.clone(), latest: None, has_update: false, manual: true, error: None });
+        let base = UpdateInfo {
+            id: a.id.clone(),
+            current: a.version.clone(),
+            latest: None,
+            has_update: false,
+            manual: a.provider == "local",
+            pinned: a.pinned,
+            error: None,
+        };
+        if base.manual {
+            out.push(base);
             continue;
         }
         let r = providers::latest(&ctx.client, st.token(), &a.provider, &a.source, a.asset_pattern.as_deref(), &game).await;
         out.push(match r {
             Ok(rel) => UpdateInfo {
-                id: a.id.clone(),
-                current: a.version.clone(),
-                has_update: !downloads::same_version(&rel.version, &a.version),
+                has_update: !a.pinned && !downloads::same_version(&rel.version, &a.version),
                 latest: Some(rel.version),
-                manual: false,
-                error: None,
+                ..base
             },
-            Err(e) => UpdateInfo { id: a.id.clone(), current: a.version.clone(), latest: None, has_update: false, manual: false, error: Some(err(e)) },
+            Err(e) => UpdateInfo { error: Some(err(e)), ..base },
         });
     }
     Ok(out)
@@ -522,6 +532,16 @@ async fn restore_settings(ctx: tauri::State<'_, Ctx>, file: String) -> Res<()> {
         .await
         .map_err(|e| e.to_string())?
         .map_err(err)
+}
+
+#[tauri::command]
+async fn set_pinned(ctx: tauri::State<'_, Ctx>, id: String, pinned: bool) -> Res<TrackedAddon> {
+    let mut st = ctx.state.lock().await;
+    let a = st.addons.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("{id} isn't tracked"))?;
+    a.pinned = pinned;
+    let out = a.clone();
+    st.save().map_err(err)?;
+    Ok(out)
 }
 
 /// Release notes for the version an update would install.
@@ -638,6 +658,7 @@ fn main() {
             rollback_options,
             roll_back,
             wow_running,
+            set_pinned,
             changelog,
             settings_backups,
             backup_settings_now,

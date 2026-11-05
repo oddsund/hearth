@@ -25,9 +25,12 @@ pub struct TrackedAddon {
     pub asset_pattern: Option<String>,
     #[serde(default)]
     pub installed_at: u64,
-    /// Remembered for a future Curse provider.
+    /// CurseForge project ID, when known.
     #[serde(default)]
     pub curse_id: Option<String>,
+    /// Stay on this version: skipped by update checks and Update all.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
