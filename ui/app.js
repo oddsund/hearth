@@ -24,10 +24,11 @@ function status(msg, isError = false) {
   el.classList.toggle("error", isError);
 }
 
+// One-off actions (check updates, save settings, remove): block only the global buttons.
 async function run(label, fn) {
   if (busy) return;
   busy = true;
-  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  render();
   status(label + "…");
   try {
     const r = await fn();
@@ -38,6 +39,65 @@ async function run(label, fn) {
     busy = false;
     render();
   }
+}
+
+// ---- Install queue: click as many as you like; up to MAX_PARALLEL run at once.
+const MAX_PARALLEL = 4;
+const jobs = new Map(); // key -> "queued" | "running"
+const queue = [];
+let running = 0;
+let results = []; // finished since the queue was last empty
+
+/** fn resolves to a success message. Keys stop the same thing being queued twice. */
+function enqueue(key, label, fn) {
+  if (jobs.has(key)) return;
+  jobs.set(key, "queued");
+  queue.push({ key, label, fn });
+  pump();
+  render();
+}
+
+function pump() {
+  while (running < MAX_PARALLEL && queue.length) {
+    const job = queue.shift();
+    running++;
+    jobs.set(job.key, "running");
+    job
+      .fn()
+      .then((msg) => results.push({ ok: true, msg }))
+      .catch((e) => results.push({ ok: false, msg: `${job.label}: ${e}` }))
+      .finally(async () => {
+        running--;
+        jobs.delete(job.key);
+        try { await refresh(); } catch (_) {}
+        pump();
+        progress();
+      });
+  }
+  progress();
+}
+
+function progress() {
+  const queued = queue.length;
+  if (running || queued) {
+    const done = results.length;
+    status(`Installing ${running}${queued ? `, ${queued} queued` : ""}${done ? ` · ${done} done` : ""}…`);
+    return;
+  }
+  if (!results.length) return;
+  const failed = results.filter((r) => !r.ok);
+  const ok = results.filter((r) => r.ok);
+  const lines = ok.length === 1 && !failed.length ? [ok[0].msg] : ok.length ? [`Finished ${ok.length}: ` + ok.map((r) => r.msg).join(" · ")] : [];
+  if (failed.length) lines.push(`${failed.length} failed:`, ...failed.map((r) => "  " + r.msg));
+  status(lines.join("\n"), failed.length > 0);
+  results = [];
+}
+
+/** Button for a queueable action: shows Queued…/Installing… while its job is pending. */
+function jobButton(key, attrs, label, cls = "") {
+  const st = jobs.get(key);
+  if (st) return `<button class="small ${cls}" disabled>${st === "running" ? "Installing…" : "Queued…"}</button>`;
+  return `<button class="small ${cls}" ${attrs}>${label}</button>`;
 }
 
 function linkRow(a) {
@@ -72,9 +132,9 @@ function render() {
         <td>${latest}</td>
         <td class="actions-cell">
           ${a.provider === "local"
-            ? `<button class="small primary" data-link="${esc(a.id)}">Link</button>`
-            : `<button class="small" data-update="${esc(a.id)}">${u?.has_update ? "Update" : "Reinstall"}</button>`}
-          <button class="small danger" data-remove="${esc(a.id)}">Remove</button>
+            ? jobButton("ln:" + a.id, `data-link="${esc(a.id)}"`, "Link", "primary")
+            : jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "")}
+          <button class="small danger" data-remove="${esc(a.id)}" ${jobs.has("up:" + a.id) || jobs.has("ln:" + a.id) ? "disabled" : ""}>Remove</button>
         </td></tr>${linkOpen === a.id ? linkRow(a) : ""}`;
     })
     .join("");
@@ -101,8 +161,10 @@ function render() {
         <td>${esc(sourceLabel(r.link_provider, r.link_source))}</td>
         <td class="actions-cell">${
           r.compatible === false && r.link_provider !== "local"
-            ? `<button class="small primary" data-remote="${i}" title="Install the newest build for your game from ${esc(sourceLabel(r.link_provider, r.link_source))} instead of this zip">Get build for your game</button>`
-            : `<button class="small ${r.status === "new" ? "" : "primary"}" data-local="${i}">${label[r.status]}</button>`
+            ? jobButton("rm:" + r.link_provider + ":" + r.link_source,
+                `data-remote="${i}" title="Install the newest build for your game from ${esc(sourceLabel(r.link_provider, r.link_source))} instead of this zip"`,
+                "Get build for your game", "primary")
+            : jobButton("dl:" + r.path, `data-local="${i}"`, label[r.status], r.status === "new" ? "" : "primary")
         }</td>
       </tr>`;
     })
@@ -120,8 +182,9 @@ function render() {
   $("empty").hidden = state.addons.length > 0;
   $("count").textContent = state.addons.length ? `(${state.addons.length})` : "";
 
-  document.querySelectorAll("button").forEach((b) => (b.disabled = busy));
-  $("btn-update-all").disabled = busy || !Object.values(updates).some((u) => u.has_update);
+  for (const id of ["btn-check", "btn-save", "btn-rescan"]) $(id).disabled = busy;
+  $("btn-update-all").disabled = busy || !Object.values(updates).some((u) => u.has_update && !jobs.has("up:" + u.id));
+  $("btn-install").disabled = jobs.has("url:" + $("in-url").value.trim());
 }
 
 async function refresh() {
@@ -168,13 +231,14 @@ $("btn-save").onclick = () =>
 $("btn-install").onclick = () => {
   const url = $("in-url").value.trim();
   if (!url) return status("Paste a URL first.", true);
-  run("Installing " + url, async () => {
-    const a = await invoke("install", { url, assetPattern: $("in-pattern").value || null });
+  const assetPattern = $("in-pattern").value || null;
+  // Clear right away so the next URL can be pasted while this one installs.
+  $("in-url").value = "";
+  $("in-pattern").value = "";
+  enqueue("url:" + url, url, async () => {
+    const a = await invoke("install", { url, assetPattern });
     delete updates[a.id];
-    $("in-url").value = "";
-    $("in-pattern").value = "";
-    await refresh();
-    status(`Installed ${a.name} ${a.version} → ${a.folders.join(", ")}`);
+    return `${a.name} ${a.version}`;
   });
 };
 $("in-url").addEventListener("keydown", (e) => e.key === "Enter" && $("btn-install").click());
@@ -192,22 +256,17 @@ $("btn-check").onclick = () =>
     );
   });
 
-$("btn-update-all").onclick = () =>
-  run("Updating", async () => {
-    const ids = Object.values(updates).filter((u) => u.has_update).map((u) => u.id);
-    const failed = [];
-    for (const id of ids) {
-      status(`Updating ${id}…`);
-      try {
-        await invoke("update_addon", { id });
-        delete updates[id];
-      } catch (e) {
-        failed.push(`${id}: ${e}`);
-      }
-    }
-    await refresh();
-    status(failed.length ? "Some updates failed:\n" + failed.join("\n") : `Updated ${ids.length} addon(s).`, failed.length > 0);
+function enqueueUpdate(id) {
+  const name = state.addons.find((a) => a.id === id)?.name ?? id;
+  enqueue("up:" + id, name, async () => {
+    const a = await invoke("update_addon", { id });
+    delete updates[id];
+    return `${a.name} ${a.version}`;
   });
+}
+
+$("btn-update-all").onclick = () =>
+  Object.values(updates).filter((u) => u.has_update).forEach((u) => enqueueUpdate(u.id));
 
 $("btn-rescan").onclick = () => run("Scanning Downloads", async () => { await refresh(); status("Rescanned Downloads."); });
 
@@ -218,22 +277,19 @@ $("downloads").onclick = (e) => {
   const ri = e.target.closest("[data-remote]")?.dataset.remote;
   if (ri !== undefined) {
     const r = actionableRows[Number(ri)];
-    return run(`Getting ${r.main.title} from ${sourceLabel(r.link_provider, r.link_source)}`, async () => {
+    return enqueue("rm:" + r.link_provider + ":" + r.link_source, r.main.title, async () => {
       const a = await invoke("install", { url: sourceUrl(r.link_provider, r.link_source), assetPattern: null });
       delete updates[a.id];
-      await refresh();
-      status(`Installed ${a.name} ${a.version} from ${sourceLabel(a.provider, a.source)}.`);
+      return `${a.name} ${a.version} (from ${sourceLabel(a.provider, a.source)})`;
     });
   }
   const i = e.target.closest("[data-local]")?.dataset.local;
   if (i === undefined) return;
   const r = actionableRows[Number(i)];
-  run("Installing " + r.file_name, async () => {
+  enqueue("dl:" + r.path, r.main.title, async () => {
     const a = await invoke("install_local", { path: r.path });
     delete updates[a.id];
-    await refresh();
-    const how = a.provider === "local" ? "update it by downloading a newer zip" : `updates will come from ${sourceLabel(a.provider, a.source)}`;
-    status(`Installed ${a.name} ${a.version}. ${how[0].toUpperCase() + how.slice(1)}.`);
+    return `${a.name} ${a.version}${a.provider === "local" ? " (manual)" : ` (updates from ${sourceLabel(a.provider, a.source)})`}`;
   });
 };
 
@@ -255,21 +311,15 @@ $("tracked").onclick = (e) => {
   if (go) {
     const source = $("in-link").value.trim();
     if (!source) return status("Paste a CurseForge project ID, GitHub URL or WoWInterface URL.", true);
-    return run("Linking", async () => {
+    const name = state.addons.find((a) => a.id === go)?.name ?? go;
+    linkOpen = null;
+    return enqueue("ln:" + go, name, async () => {
       const a = await invoke("link_addon", { id: go, source });
-      linkOpen = null;
       delete updates[go];
-      await refresh();
-      status(`${a.name} now updates from ${sourceLabel(a.provider, a.source)} (installed ${a.version}).`);
+      return `${a.name} ${a.version} (now updates from ${sourceLabel(a.provider, a.source)})`;
     });
   }
-  if (up)
-    run("Updating " + up, async () => {
-      const a = await invoke("update_addon", { id: up });
-      delete updates[up];
-      await refresh();
-      status(`${a.name} is now ${a.version}`);
-    });
+  if (up) enqueueUpdate(up);
   if (rm) {
     const a = state.addons.find((x) => x.id === rm);
     if (!confirm(`Remove ${a?.name}? Its folders are moved to the backup folder, not deleted.`)) return;

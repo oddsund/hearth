@@ -187,6 +187,7 @@ fn restore(moved: &[(PathBuf, PathBuf)]) {
 }
 
 /// Download and install. Returns the folder names now owned by this addon.
+#[allow(dead_code)] // the app downloads first and swaps under the state lock; tests use this
 pub async fn install(
     client: &reqwest::Client,
     addons_dir: &Path,

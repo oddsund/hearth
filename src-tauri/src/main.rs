@@ -117,22 +117,33 @@ fn old_folders(st: &AppState, id: &str) -> Vec<String> {
 }
 
 /// Install/update from an online source. `extra_old` = folders of another entry being replaced.
-/// Caller holds the state lock.
-async fn do_install(st: &mut AppState, client: &reqwest::Client, o: Origin, extra_old: &[String]) -> anyhow::Result<TrackedAddon> {
+/// The state lock is NOT held while talking to the network, so several installs download in
+/// parallel; only the folder swap + state write is serialized.
+async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Result<TrackedAddon> {
     if o.provider == "local" {
         anyhow::bail!("Installed from a zip with no online source. Use Link to connect it to GitHub, WoWInterface or CurseForge.");
     }
     let id = o.id();
-    let game = game::detect(Path::new(&st.addons_dir));
-    let rel = providers::latest(client, st.token(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
-    let mut old = old_folders(st, &id);
+    let (addons_dir, token) = {
+        let st = ctx.state.lock().await;
+        (st.addons_dir.clone(), st.token().map(String::from))
+    };
+    if !Path::new(&addons_dir).is_dir() {
+        anyhow::bail!("AddOns folder not found: {addons_dir}. Check Settings.");
+    }
+    let game = game::detect(Path::new(&addons_dir));
+    let rel = providers::latest(&ctx.client, token.as_deref(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
+    let bytes = installer::download(&ctx.client, &rel.download_url).await?;
+
+    let mut st = ctx.state.lock().await;
+    let mut old = old_folders(&st, &id);
     for f in extra_old {
         if !old.iter().any(|o| o.eq_ignore_ascii_case(f)) {
             old.push(f.clone());
         }
     }
-    let folders = installer::install(client, Path::new(&st.addons_dir), &id, &rel.download_url, &old).await?;
-    record(st, o, rel.version, folders)
+    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old)?;
+    record(&mut st, o, rel.version, folders)
 }
 
 fn tracked_owner<'a>(st: &'a AppState, folder: &str) -> Option<&'a TrackedAddon> {
@@ -273,21 +284,23 @@ async fn install(ctx: tauri::State<'_, Ctx>, url: String, asset_pattern: Option<
         asset_pattern: asset_pattern.filter(|s| !s.trim().is_empty()),
         curse_id: None,
     };
-    let mut st = ctx.state.lock().await;
-    do_install(&mut st, &ctx.client, o, &[]).await.map_err(err)
+    do_install(ctx.inner(), o, &[]).await.map_err(err)
 }
 
 /// Connect an addon (usually a manual one) to an online source and install the latest from there.
 #[tauri::command]
 async fn link_addon(ctx: tauri::State<'_, Ctx>, id: String, source: String) -> Res<TrackedAddon> {
     let p = providers::parse_url(&source).map_err(err)?;
-    let mut st = ctx.state.lock().await;
-    let old = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
+    let old = {
+        let st = ctx.state.lock().await;
+        st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
+    };
     let curse_id = if p.provider == "curse" { Some(p.source.clone()) } else { old.curse_id.clone() };
     let o = Origin { provider: p.provider.into(), source: p.source, url: p.url, asset_pattern: None, curse_id };
-    let new = do_install(&mut st, &ctx.client, o, &old.folders).await.map_err(err)?;
+    let new = do_install(ctx.inner(), o, &old.folders).await.map_err(err)?;
     if new.id != old.id {
         // Its folders were backed up/replaced by the install above.
+        let mut st = ctx.state.lock().await;
         st.addons.retain(|a| a.id != old.id);
         st.save().map_err(err)?;
     }
@@ -322,10 +335,12 @@ async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
 
 #[tauri::command]
 async fn update_addon(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> {
-    let mut st = ctx.state.lock().await;
-    let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
+    let a = {
+        let st = ctx.state.lock().await;
+        st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
+    };
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    do_install(&mut st, &ctx.client, o, &[]).await.map_err(err)
+    do_install(ctx.inner(), o, &[]).await.map_err(err)
 }
 
 /// Moves the addon's folders to the backup area (not a hard delete) and stops tracking it.
