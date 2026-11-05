@@ -271,6 +271,15 @@ async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
     Ok(rows)
 }
 
+/// Changes whenever a zip is added, removed or replaced in Downloads (as a string: u64 > JS number).
+#[tauri::command]
+async fn downloads_signature(ctx: tauri::State<'_, Ctx>) -> Res<String> {
+    let dir = PathBuf::from(&ctx.state.lock().await.downloads_dir);
+    tauri::async_runtime::spawn_blocking(move || downloads::signature(&dir).to_string())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn install_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<TrackedAddon> {
     let p = PathBuf::from(&path);
@@ -445,6 +454,7 @@ fn main() {
             save_settings,
             scan,
             scan_downloads,
+            downloads_signature,
             install_local,
             install,
             link_addon,

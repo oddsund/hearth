@@ -330,6 +330,23 @@ async function checkUpdates(quiet = false) {
 
 $("btn-check").onclick = () => run("Checking for updates", () => checkUpdates());
 
+// Watch Downloads: poll a cheap fingerprint and rescan only when it changes.
+let dlSignature = null;
+let refreshing = false;
+async function watchDownloads() {
+  if (refreshing || document.hidden) return;
+  let sig;
+  try { sig = await invoke("downloads_signature"); } catch (_) { return; }
+  if (dlSignature !== null && sig !== dlSignature) {
+    if (busy) return; // try again next tick, don't swallow the change
+    refreshing = true;
+    try { await refresh(); } catch (_) {} finally { refreshing = false; }
+  }
+  dlSignature = sig;
+}
+setInterval(watchDownloads, 3000);
+window.addEventListener("focus", watchDownloads);
+
 const RECHECK_MS = 6 * 60 * 60 * 1000;
 async function autoCheck() {
   if (busy || !state.addons.some((a) => a.provider !== "local")) return;

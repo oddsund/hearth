@@ -90,8 +90,12 @@ fn local_zip_discovery_and_install() {
     make("Foo-1.2.0(1).zip", body); // browser duplicate
     std::fs::write(dl.path().join("notes.zip"), b"not a zip").unwrap();
 
+    let sig = crate::downloads::signature(dl.path());
+    assert_eq!(sig, crate::downloads::signature(dl.path()), "stable while nothing changes");
     let found = crate::downloads::scan(dl.path());
     assert_eq!(found.len(), 1, "duplicates collapsed, junk skipped");
+    std::fs::remove_file(dl.path().join("notes.zip")).unwrap();
+    assert_ne!(sig, crate::downloads::signature(dl.path()), "changes when a zip goes away");
     let c = &found[0];
     assert_eq!(c.folders, vec!["Foo", "Foo_Options"]);
     assert_eq!(c.main.title, "Foo");

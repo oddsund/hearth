@@ -119,6 +119,27 @@ pub fn scan(dir: &Path) -> Vec<Candidate> {
     v
 }
 
+/// Cheap fingerprint of the zips in `dir` (names, sizes, mtimes), for polling.
+/// inotify doesn't see changes Windows makes under /mnt/c, so the UI polls this.
+pub fn signature(dir: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(String, u64, u64)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x.eq_ignore_ascii_case("zip")).unwrap_or(false))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            let t = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+            Some((e.file_name().to_string_lossy().into_owned(), m.len(), t))
+        })
+        .collect();
+    entries.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut h);
+    h.finish()
+}
+
 /// "v1.2.10" vs "1.2.9" -> Greater. None if either has no numbers.
 pub fn cmp_versions(a: &str, b: &str) -> Option<Ordering> {
     fn nums(s: &str) -> Vec<u64> {
