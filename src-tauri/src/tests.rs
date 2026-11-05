@@ -198,6 +198,31 @@ async fn curseforge_forever_build() {
     install_into_temp("curse", "298842").await;
 }
 
+#[test]
+fn settings_snapshot_and_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let flavor = root.path().join(format!("_hearthtest{}_", std::process::id()));
+    let addons = flavor.join("Interface").join("AddOns");
+    let sv = flavor.join("WTF").join("Account").join("ME").join("SavedVariables");
+    std::fs::create_dir_all(&addons).unwrap();
+    std::fs::create_dir_all(&sv).unwrap();
+    std::fs::write(sv.join("Foo.lua"), "FooDB = { good = true }").unwrap();
+
+    let snap = crate::wtf::snapshot(&addons, "manual").unwrap().expect("snapshot taken");
+    assert_eq!(snap.reason, "manual");
+    assert!(crate::wtf::snapshot_if_stale(&addons, std::time::Duration::from_secs(600)).unwrap().is_none(), "fresh one exists");
+
+    std::fs::write(sv.join("Foo.lua"), "FooDB = { broken = true }").unwrap();
+    crate::wtf::restore(&addons, std::path::Path::new(&snap.file)).unwrap();
+    assert_eq!(std::fs::read_to_string(sv.join("Foo.lua")).unwrap(), "FooDB = { good = true }");
+    let list = crate::wtf::list(&addons);
+    assert!(list.iter().any(|s| s.reason == "before-restore"), "restore keeps the state it replaced");
+    assert!(!flavor.join("WTF.hearth-old").exists() && !flavor.join("WTF.hearth-restore").exists());
+
+    let store = std::path::Path::new(&snap.file).parent().unwrap().to_path_buf();
+    let _ = std::fs::remove_dir_all(store);
+}
+
 /// Asks Windows whether WoW runs (read-only).
 #[test]
 #[ignore]

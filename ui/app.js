@@ -279,7 +279,43 @@ async function refresh() {
   render();
 }
 
-$("btn-settings").onclick = () => ($("settings").hidden = !$("settings").hidden);
+$("btn-settings").onclick = () => {
+  $("settings").hidden = !$("settings").hidden;
+  if (!$("settings").hidden) renderSettingsBackups();
+};
+
+// ---- WTF (addon settings) backups
+const reasonLabel = { auto: "before changing addons", manual: "manual", "before-restore": "before a restore" };
+const fmtSize = (n) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+async function renderSettingsBackups() {
+  let list = [];
+  try { list = await invoke("settings_backups"); } catch (_) {}
+  $("wtf-list").innerHTML = list.length
+    ? list.map((s) => `<tr>
+        <td>${esc(new Date(s.taken_at_ms).toLocaleString())}</td>
+        <td class="muted">${esc(reasonLabel[s.reason] ?? s.reason)}</td>
+        <td class="muted">${fmtSize(s.size)}</td>
+        <td class="actions-cell"><button class="small" data-wtf-restore="${esc(s.file)}">Restore</button></td>
+      </tr>`).join("")
+    : `<tr><td class="muted">No backups yet.</td></tr>`;
+}
+$("btn-wtf-now").onclick = () =>
+  run("Backing up addon settings", async () => {
+    const s = await invoke("backup_settings_now");
+    await renderSettingsBackups();
+    status(s ? `Addon settings backed up (${fmtSize(s.size)}).` : "No WTF folder yet, so there's nothing to back up.");
+  });
+$("wtf-list").onclick = (e) => {
+  const file = e.target.closest("[data-wtf-restore]")?.dataset.wtfRestore;
+  if (!file) return;
+  if (!confirm("Replace your current addon settings (WTF folder) with this backup?\n\nHearth backs up the current settings first, so you can undo this.")) return;
+  run("Restoring addon settings", async () => {
+    if (!(await wowGate())) return status("Cancelled: WoW is running.");
+    await invoke("restore_settings", { file });
+    await renderSettingsBackups();
+    status("Addon settings restored. Your previous settings are the newest backup in the list.");
+  });
+};
 
 $("btn-save").onclick = () =>
   run("Saving", async () => {

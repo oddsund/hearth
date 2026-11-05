@@ -70,6 +70,7 @@ a.ext { color: var(--accent); text-decoration: none; }
 a.ext:hover { text-decoration: underline; }
 .card-head { display: flex; justify-content: space-between; align-items: baseline; }
 .card-head h2 { margin-bottom: 10px; }
+.card-head.sub { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
 .bad { color: var(--bad); }
 code { font-family: Consolas, monospace; font-size: 12.5px; }
 details { margin-top: 8px; }

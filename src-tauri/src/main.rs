@@ -6,8 +6,16 @@ mod installer;
 mod providers;
 mod state;
 mod toc;
+mod wtf;
 #[cfg(test)]
 mod tests;
+
+/// Snapshot WTF before changing addons (at most every 10 minutes). Never blocks the change.
+fn protect_settings(addons_dir: &Path) {
+    if let Err(e) = wtf::snapshot_if_stale(addons_dir, std::time::Duration::from_secs(600)) {
+        eprintln!("hearth: settings backup failed: {e:#}");
+    }
+}
 
 use serde::Serialize;
 use state::{AppState, TrackedAddon};
@@ -143,6 +151,7 @@ async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Resul
         }
     }
     let old_version = tracked_version(&st, &id, &old);
+    protect_settings(Path::new(&st.addons_dir));
     let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old, old_version.as_deref())?;
     record(&mut st, o, rel.version, folders)
 }
@@ -290,6 +299,7 @@ async fn install_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<TrackedA
     let id = o.id();
     let old = old_folders(&st, &id);
     let old_version = tracked_version(&st, &id, &old);
+    protect_settings(Path::new(&st.addons_dir));
     let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old, old_version.as_deref()).map_err(err)?;
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
     record(&mut st, o, version, folders).map_err(err)
@@ -369,10 +379,35 @@ async fn update_addon(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddo
 async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
     let mut st = ctx.state.lock().await;
     let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
+    protect_settings(Path::new(&st.addons_dir));
     installer::backup_folders(Path::new(&st.addons_dir), &a.id, &a.folders, Some(&a.version)).map_err(err)?;
     st.addons.retain(|x| x.id != id);
     st.save().map_err(err)?;
     Ok(())
+}
+
+#[tauri::command]
+async fn settings_backups(ctx: tauri::State<'_, Ctx>) -> Res<Vec<wtf::Snapshot>> {
+    let dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
+    Ok(wtf::list(&dir))
+}
+
+#[tauri::command]
+async fn backup_settings_now(ctx: tauri::State<'_, Ctx>) -> Res<Option<wtf::Snapshot>> {
+    let dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
+    tauri::async_runtime::spawn_blocking(move || wtf::snapshot(&dir, "manual"))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn restore_settings(ctx: tauri::State<'_, Ctx>, file: String) -> Res<()> {
+    let dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
+    tauri::async_runtime::spawn_blocking(move || wtf::restore(&dir, Path::new(&file)))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)
 }
 
 /// Is WoW running? null when it can't be checked.
@@ -397,6 +432,7 @@ async fn rollback_options(ctx: tauri::State<'_, Ctx>) -> Res<std::collections::H
 async fn roll_back(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> {
     let mut st = ctx.state.lock().await;
     let addons_dir = PathBuf::from(&st.addons_dir);
+    protect_settings(&addons_dir);
     let a = st.addons.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("{id} isn't tracked"))?;
     let meta = installer::roll_back(&addons_dir, &a.id, &a.folders, &a.version).map_err(err)?;
     a.version = meta.version.unwrap_or_else(|| "previous".into());
@@ -464,6 +500,9 @@ fn main() {
             rollback_options,
             roll_back,
             wow_running,
+            settings_backups,
+            backup_settings_now,
+            restore_settings,
             open_url,
             backup_location
         ])
