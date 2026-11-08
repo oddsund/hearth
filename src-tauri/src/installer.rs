@@ -15,15 +15,48 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The site answered with something other than a zip, typically a "log in" web page.
+#[derive(Debug)]
+pub struct NotAZip {
+    pub url: String,
+}
+
+impl std::fmt::Display for NotAZip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The download wasn't a zip file: the site sent a web page instead ({})", self.url)
+    }
+}
+
+impl std::error::Error for NotAZip {}
+
+/// No addon zip comes close; stops a bad link from filling memory.
+const MAX_DOWNLOAD: usize = 500 << 20;
+
 pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
         .context("Download failed")?
         .error_for_status()
         .context("Download failed")?;
-    Ok(resp.bytes().await?.to_vec())
+    let html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/html"));
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("Download failed")? {
+        if bytes.len() + chunk.len() > MAX_DOWNLOAD {
+            bail!("The download is bigger than 500 MB; refusing it ({url})");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    // Every zip starts with "PK". Catch web pages here instead of failing later in the unzip.
+    if html || !bytes.starts_with(b"PK") {
+        return Err(NotAZip { url: url.to_string() }.into());
+    }
+    Ok(bytes)
 }
 
 /// Addons unpack to a few MB, the biggest to a few hundred. Far beyond that is a zip bomb.

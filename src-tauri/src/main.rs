@@ -18,6 +18,7 @@ fn protect_settings(addons_dir: &Path) {
     }
 }
 
+use anyhow::Context;
 use serde::Serialize;
 use state::{AppState, TrackedAddon};
 use std::cmp::Ordering;
@@ -226,12 +227,45 @@ async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Resul
         anyhow::bail!("AddOns folder not found: {addons_dir}. Check Settings.");
     }
     let game = game::detect(Path::new(&addons_dir));
-    let rel = providers::latest(&ctx.client, token.as_deref(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
-    let bytes = installer::download(&ctx.client, &rel.download_url).await?;
+    let mut o = o;
+    let mut id = id;
+    let mut replaced_id: Option<String> = None;
+    let mut rel = providers::latest(&ctx.client, token.as_deref(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
+    let bytes = match installer::download(&ctx.client, &rel.download_url).await {
+        Ok(b) => b,
+        // WoWInterface now answers app downloads with a "log in" page. Use CurseForge instead
+        // when the addon is known there, and switch its updates to CurseForge.
+        Err(e) if o.provider == "wowi" && e.downcast_ref::<installer::NotAZip>().is_some() => {
+            let wowi_page = format!("https://www.wowinterface.com/downloads/download{}", o.source);
+            let Some(cid) = o.curse_id.clone() else {
+                anyhow::bail!(
+                    "WoWInterface no longer lets apps download this addon. Download it from {wowi_page} \
+                     (Hearth installs it from your Downloads folder), or use Link to switch it to CurseForge."
+                );
+            };
+            let curse = Origin {
+                provider: "curse".into(),
+                url: format!("https://www.curseforge.com/projects/{cid}"),
+                source: cid.clone(),
+                asset_pattern: None,
+                curse_id: Some(cid),
+            };
+            rel = providers::latest(&ctx.client, None, &curse.provider, &curse.source, None, &game)
+                .await
+                .context("WoWInterface refused the download, and CurseForge has no build for this game either")?;
+            let b = installer::download(&ctx.client, &rel.download_url).await?;
+            replaced_id = Some(id);
+            id = curse.id();
+            o = curse;
+            b
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut st = ctx.state.lock().await;
     let mut old = old_folders(&st, &id);
-    for f in extra_old {
+    let replaced = replaced_id.as_deref().map(|r| old_folders(&st, r)).unwrap_or_default();
+    for f in extra_old.iter().chain(&replaced) {
         if !old.iter().any(|o| o.eq_ignore_ascii_case(f)) {
             old.push(f.clone());
         }

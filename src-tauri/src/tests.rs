@@ -185,10 +185,25 @@ async fn github_packaged_release() {
     install_into_temp("github", "BigWigsMods/BigWigs").await;
 }
 
+/// WoWInterface's API still reports versions, but (since Nov 2026) its download links answer
+/// apps with a "log in" page. Hearth must report that clearly instead of a broken-zip error.
 #[tokio::test]
 #[ignore]
 async fn wowinterface_addon() {
-    install_into_temp("wowi", "5108").await;
+    let c = client();
+    let rel = providers::latest(&c, None, "wowi", "5108", None, &forever()).await.unwrap();
+    println!("5108: {} <- {}", rel.version, rel.download_url);
+    match installer::download(&c, &rel.download_url).await {
+        Ok(bytes) => assert!(bytes.starts_with(b"PK")),
+        Err(e) => assert!(e.downcast_ref::<installer::NotAZip>().is_some(), "unexpected error: {e:#}"),
+    }
+}
+
+/// The fallback for What's Training when WoWInterface refuses: CurseForge 324944 for _forever_.
+#[tokio::test]
+#[ignore]
+async fn whats_training_on_curseforge() {
+    install_into_temp("curse", "324944").await;
 }
 
 /// Leatrix Maps: should pick the -forever build, not retail.

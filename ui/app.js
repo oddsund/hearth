@@ -438,12 +438,15 @@ async function autoCheck() {
 setInterval(autoCheck, RECHECK_MS);
 
 function enqueueUpdate(id) {
-  const name = state.addons.find((a) => a.id === id)?.name ?? id;
+  const before = state.addons.find((a) => a.id === id);
+  const name = before?.name ?? id;
   enqueue("up:" + id, name, async () => {
     const a = await invoke("update_addon", { id });
     delete updates[id];
     delete notes[id];
     if (notesOpen === id) notesOpen = null;
+    if (before && a.id !== before.id)
+      return `${a.name} ${a.version} (${sourceLabel(before.provider, before.source)} refused the download, so it now updates from ${sourceLabel(a.provider, a.source)})`;
     return `${a.name} ${a.version}`;
   });
 }
