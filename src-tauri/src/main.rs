@@ -713,32 +713,47 @@ async fn link_addon(ctx: tauri::State<'_, Ctx>, id: String, source: String) -> R
 
 #[tauri::command]
 async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
+    use std::sync::Arc;
+    /// Lookups in flight at once: quick with many addons, still gentle on GitHub and CurseForge.
+    const PARALLEL: usize = 6;
     let st = ctx.state.lock().await.clone();
-    let game = game::detect(Path::new(&st.addons_dir));
-    let mut out = Vec::new();
-    for a in &st.addons {
-        let base = UpdateInfo {
-            id: a.id.clone(),
-            current: a.version.clone(),
-            latest: None,
-            has_update: false,
-            manual: a.provider == "local",
-            pinned: a.pinned,
-            error: None,
-        };
-        if base.manual {
-            out.push(base);
-            continue;
-        }
-        let r = providers::latest(&ctx.client, st.token(), &a.provider, &a.source, a.asset_pattern.as_deref(), &game).await;
-        out.push(match r {
-            Ok(rel) => UpdateInfo {
-                has_update: !a.pinned && !downloads::same_version(&rel.version, &a.version),
-                latest: Some(rel.version),
-                ..base
-            },
-            Err(e) => UpdateInfo { error: Some(err(e)), ..base },
-        });
+    let game = Arc::new(game::detect(Path::new(&st.addons_dir)));
+    let token: Option<Arc<str>> = st.token().map(Arc::from);
+    let gate = Arc::new(tokio::sync::Semaphore::new(PARALLEL));
+    let tasks: Vec<_> = st
+        .addons
+        .into_iter()
+        .map(|a| {
+            let (client, game, token, gate) = (ctx.client.clone(), game.clone(), token.clone(), gate.clone());
+            tauri::async_runtime::spawn(async move {
+                let base = UpdateInfo {
+                    id: a.id.clone(),
+                    current: a.version.clone(),
+                    latest: None,
+                    has_update: false,
+                    manual: a.provider == "local",
+                    pinned: a.pinned,
+                    error: None,
+                };
+                if base.manual {
+                    return base;
+                }
+                let _turn = gate.acquire().await;
+                match providers::latest(&client, token.as_deref(), &a.provider, &a.source, a.asset_pattern.as_deref(), &game).await {
+                    Ok(rel) => UpdateInfo {
+                        has_update: !a.pinned && !downloads::same_version(&rel.version, &a.version),
+                        latest: Some(rel.version),
+                        ..base
+                    },
+                    Err(e) => UpdateInfo { error: Some(err(e)), ..base },
+                }
+            })
+        })
+        .collect();
+    // Same order as the addon list.
+    let mut out = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        out.push(t.await.map_err(|e| format!("Update check failed: {e}"))?);
     }
     Ok(out)
 }
