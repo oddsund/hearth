@@ -5,6 +5,7 @@ mod game;
 mod installer;
 mod providers;
 mod state;
+mod review;
 mod toc;
 mod trash;
 mod wtf;
@@ -28,6 +29,18 @@ use tokio::sync::Mutex;
 struct Ctx {
     state: Mutex<AppState>,
     client: reqwest::Client,
+    /// Updates unpacked for Show diff, waiting for Install or Cancel. token -> pending update.
+    reviews: std::sync::Mutex<std::collections::BTreeMap<String, Pending>>,
+}
+
+/// An update unpacked and reviewed, not installed yet.
+struct Pending {
+    origin: Origin,
+    version: String,
+    stage: installer::Stage,
+    replaced_id: Option<String>,
+    old_folders: Vec<String>,
+    review: review::Review,
 }
 
 type Res<T> = Result<T, String>;
@@ -152,6 +165,7 @@ struct DownloadRow {
 }
 
 /// Where an addon comes from and how to update it.
+#[derive(Clone)]
 struct Origin {
     provider: String,
     source: String,
@@ -211,14 +225,67 @@ fn old_folders(st: &AppState, id: &str) -> Vec<String> {
     st.addons.iter().find(|a| a.id == id).map(|a| a.folders.clone()).unwrap_or_default()
 }
 
+/// An update downloaded but not installed yet.
+struct Fetched {
+    o: Origin,
+    version: String,
+    bytes: Vec<u8>,
+    /// Tracked entry this replaces under another id (WoWInterface -> CurseForge switch).
+    replaced_id: Option<String>,
+}
+
 /// Install/update from an online source. `extra_old` = folders of another entry being replaced.
 /// The state lock is NOT held while talking to the network, so several installs download in
 /// parallel; only the folder swap + state write is serialized.
 async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Result<TrackedAddon> {
+    let f = fetch(ctx, o).await?;
+    let stage = installer::stage(&f.bytes)?;
+    refuse_programs(&stage)?;
+    apply_stage(ctx, f.o, f.version, stage, extra_old, f.replaced_id).await
+}
+
+/// Plain Update/Install refuses updates that ship Windows program files; Show diff lets you decide.
+fn refuse_programs(stage: &installer::Stage) -> anyhow::Result<()> {
+    let p = review::program_files(stage);
+    if !p.is_empty() {
+        anyhow::bail!(
+            "Blocked: this contains files that can run on Windows ({}). WoW addons never need these. \
+             Use Show diff to look at it and decide.",
+            p.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Swap an unpacked update into AddOns and record it. Takes the state lock.
+async fn apply_stage(
+    ctx: &Ctx,
+    o: Origin,
+    version: String,
+    stage: installer::Stage,
+    extra_old: &[String],
+    replaced_id: Option<String>,
+) -> anyhow::Result<TrackedAddon> {
+    let id = o.id();
+    let mut st = ctx.state.lock().await;
+    let mut old = old_folders(&st, &id);
+    let replaced = replaced_id.as_deref().map(|r| old_folders(&st, r)).unwrap_or_default();
+    for f in extra_old.iter().chain(&replaced) {
+        if !old.iter().any(|o| o.eq_ignore_ascii_case(f)) {
+            old.push(f.clone());
+        }
+    }
+    let old_version = tracked_version(&st, &id, &old);
+    protect_settings(Path::new(&st.addons_dir));
+    let folders = installer::install_staged(Path::new(&st.addons_dir), &id, stage, &old, old_version.as_deref())?;
+    record(&mut st, o, version, folders)
+}
+
+/// Find and download the newest build (with the WoWInterface -> CurseForge fallback).
+async fn fetch(ctx: &Ctx, o: Origin) -> anyhow::Result<Fetched> {
     if o.provider == "local" {
         anyhow::bail!("Installed from a zip with no online source. Use Link to connect it to GitHub, WoWInterface or CurseForge.");
     }
-    let id = o.id();
     let (addons_dir, token) = {
         let st = ctx.state.lock().await;
         (st.addons_dir.clone(), st.token().map(String::from))
@@ -228,7 +295,6 @@ async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Resul
     }
     let game = game::detect(Path::new(&addons_dir));
     let mut o = o;
-    let mut id = id;
     let mut replaced_id: Option<String> = None;
     let mut rel = providers::latest(&ctx.client, token.as_deref(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
     let bytes = match installer::download(&ctx.client, &rel.download_url).await {
@@ -254,26 +320,13 @@ async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Resul
                 .await
                 .context("WoWInterface refused the download, and CurseForge has no build for this game either")?;
             let b = installer::download(&ctx.client, &rel.download_url).await?;
-            replaced_id = Some(id);
-            id = curse.id();
+            replaced_id = Some(o.id());
             o = curse;
             b
         }
         Err(e) => return Err(e),
     };
-
-    let mut st = ctx.state.lock().await;
-    let mut old = old_folders(&st, &id);
-    let replaced = replaced_id.as_deref().map(|r| old_folders(&st, r)).unwrap_or_default();
-    for f in extra_old.iter().chain(&replaced) {
-        if !old.iter().any(|o| o.eq_ignore_ascii_case(f)) {
-            old.push(f.clone());
-        }
-    }
-    let old_version = tracked_version(&st, &id, &old);
-    protect_settings(Path::new(&st.addons_dir));
-    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old, old_version.as_deref())?;
-    record(&mut st, o, rel.version, folders)
+    Ok(Fetched { o, version: rel.version, bytes, replaced_id })
 }
 
 /// Version being replaced: the tracked entry's, else whoever owns those folders.
@@ -468,15 +521,126 @@ async fn install_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<TrackedA
     let p = PathBuf::from(&path);
     let (_, info) = downloads::inspect(&p).ok_or_else(|| format!("{path} isn't an addon zip"))?;
     let bytes = std::fs::read(&p).map_err(|e| format!("Reading {path}: {e}"))?;
-    let mut st = ctx.state.lock().await;
-    let o = origin_for(&st, &info);
-    let id = o.id();
-    let old = old_folders(&st, &id);
-    let old_version = tracked_version(&st, &id, &old);
-    protect_settings(Path::new(&st.addons_dir));
-    let folders = installer::install_bytes(Path::new(&st.addons_dir), &id, &bytes, &old, old_version.as_deref()).map_err(err)?;
+    let stage = installer::stage(&bytes).map_err(err)?;
+    refuse_programs(&stage).map_err(err)?;
+    let o = origin_for(&*ctx.state.lock().await, &info);
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
-    record(&mut st, o, version, folders).map_err(err)
+    apply_stage(ctx.inner(), o, version, stage, &[], None).await.map_err(err)
+}
+
+// ---- Show diff: unpack an update, compare it with what's installed, then install or cancel.
+
+#[derive(Serialize)]
+struct ReviewOut {
+    token: String,
+    name: String,
+    from_version: Option<String>,
+    to_version: String,
+    source: String,
+    review: review::Review,
+}
+
+async fn start_review(
+    ctx: &Ctx,
+    name: String,
+    from_version: Option<String>,
+    origin: Origin,
+    version: String,
+    stage: installer::Stage,
+    replaced_id: Option<String>,
+) -> Res<ReviewOut> {
+    let (addons_dir, old) = {
+        let st = ctx.state.lock().await;
+        let mut old = old_folders(&st, &origin.id());
+        for f in replaced_id.as_deref().map(|r| old_folders(&st, r)).unwrap_or_default() {
+            if !old.iter().any(|o| o.eq_ignore_ascii_case(&f)) {
+                old.push(f);
+            }
+        }
+        (PathBuf::from(&st.addons_dir), old)
+    };
+    // Reading and diffing every file can take a moment for big addons: off the async threads.
+    let (stage, old, rv) = tauri::async_runtime::spawn_blocking(move || {
+        let rv = review::review(&addons_dir, &stage, &old);
+        (stage, old, rv)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let token = format!("{:013}-{}", installer::now(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let out = ReviewOut {
+        token: token.clone(),
+        name,
+        from_version,
+        to_version: version.clone(),
+        source: format!("{}:{}", origin.provider, origin.source),
+        review: rv.clone(),
+    };
+    let mut pending = ctx.reviews.lock().unwrap_or_else(|e| e.into_inner());
+    while pending.len() >= 8 {
+        let oldest = pending.keys().next().cloned().unwrap_or_default();
+        pending.remove(&oldest); // abandoned reviews: drop their temp folders
+    }
+    pending.insert(token, Pending { origin, version, stage, replaced_id, old_folders: old, review: rv });
+    Ok(out)
+}
+
+/// Download a tracked addon's update and review it without installing.
+#[tauri::command]
+async fn review_update(ctx: tauri::State<'_, Ctx>, id: String) -> Res<ReviewOut> {
+    let a = {
+        let st = ctx.state.lock().await;
+        st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
+    };
+    let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
+    let f = fetch(ctx.inner(), o).await.map_err(err)?;
+    let stage = installer::stage(&f.bytes).map_err(err)?;
+    start_review(ctx.inner(), a.name, Some(a.version), f.o, f.version, stage, f.replaced_id).await
+}
+
+/// Review a zip from Downloads against what's installed.
+#[tauri::command]
+async fn review_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<ReviewOut> {
+    let p = PathBuf::from(&path);
+    let (_, info) = downloads::inspect(&p).ok_or_else(|| format!("{path} isn't an addon zip"))?;
+    let bytes = std::fs::read(&p).map_err(|e| format!("Reading {path}: {e}"))?;
+    let stage = installer::stage(&bytes).map_err(err)?;
+    let (o, from) = {
+        let st = ctx.state.lock().await;
+        let from = toc::read_info(&Path::new(&st.addons_dir).join(&info.folder)).and_then(|i| i.version);
+        (origin_for(&st, &info), from)
+    };
+    let version = info.version.clone().unwrap_or_else(|| "unknown".into());
+    start_review(ctx.inner(), info.title.clone(), from, o, version, stage, None).await
+}
+
+/// Unified diff of one file in a pending review.
+#[tauri::command]
+async fn review_file(ctx: tauri::State<'_, Ctx>, token: String, path: String) -> Res<String> {
+    let addons_dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
+    let pending = ctx.reviews.lock().unwrap_or_else(|e| e.into_inner());
+    let p = pending.get(&token).ok_or("This review has expired. Open Show diff again.")?;
+    Ok(review::file_diff(&addons_dir, &p.stage, &p.old_folders, &path))
+}
+
+/// Install a reviewed update. `allow_programs` = the user saw the program-file warning and said yes.
+#[tauri::command]
+async fn apply_review(ctx: tauri::State<'_, Ctx>, token: String, allow_programs: bool) -> Res<TrackedAddon> {
+    let p = {
+        let mut pending = ctx.reviews.lock().unwrap_or_else(|e| e.into_inner());
+        let p = pending.remove(&token).ok_or("This review has expired. Open Show diff again.")?;
+        if p.review.has_danger() && !allow_programs {
+            pending.insert(token, p);
+            return Err("This update contains Windows program files. Confirm to install it anyway.".into());
+        }
+        p
+    };
+    apply_stage(ctx.inner(), p.origin, p.version, p.stage, &[], p.replaced_id).await.map_err(err)
+}
+
+#[tauri::command]
+fn discard_review(ctx: tauri::State<'_, Ctx>, token: String) {
+    ctx.reviews.lock().unwrap_or_else(|e| e.into_inner()).remove(&token);
 }
 
 #[tauri::command]
@@ -830,9 +994,14 @@ fn main() {
             }
             Ok(())
         })
-        .manage(Ctx { state: Mutex::new(AppState::load()), client })
+        .manage(Ctx { state: Mutex::new(AppState::load()), client, reviews: Default::default() })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            review_update,
+            review_local,
+            review_file,
+            apply_review,
+            discard_review,
             save_settings,
             scan,
             scan_downloads,

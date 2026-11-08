@@ -206,6 +206,25 @@ async fn whats_training_on_curseforge() {
     install_into_temp("curse", "324944").await;
 }
 
+/// Real review, read-only: What's Training from CurseForge vs. the copy in the real AddOns folder.
+#[tokio::test]
+#[ignore]
+async fn real_review_whats_training() {
+    let c = client();
+    let rel = providers::latest(&c, None, "curse", "324944", None, &forever()).await.unwrap();
+    let stage = installer::stage(&installer::download(&c, &rel.download_url).await.unwrap()).unwrap();
+    let addons = crate::state::detect_addons_dir();
+    let r = crate::review::review(std::path::Path::new(&addons), &stage, &["WhatsTraining".into()]);
+    println!("{} -> {}: {} changed, {} unchanged", addons, rel.version, r.files.len(), r.unchanged);
+    for f in r.files.iter().take(12) {
+        println!("  {} {} +{} -{}", &f.status[..1].to_uppercase(), f.path, f.added, f.removed);
+    }
+    for f in &r.findings {
+        println!("  [{}] {}:{:?} {}", f.severity, f.path, f.line, f.message);
+    }
+    assert!(!r.has_danger());
+}
+
 /// Leatrix Maps: should pick the -forever build, not retail.
 #[tokio::test]
 #[ignore]
@@ -223,6 +242,59 @@ fn wsl_paths_to_windows() {
     assert_eq!(crate::trash::windows_path(Path::new("/mnt/d")).as_deref(), Some("D:"));
     assert_eq!(crate::trash::windows_path(Path::new("/root/a.zip")), None);
     assert_eq!(crate::trash::windows_path(Path::new("/mnt/cc/a.zip")), None);
+}
+
+#[test]
+fn review_lists_changes_and_flags_risky_code() {
+    use std::io::Write;
+    let addons = tempfile::tempdir().unwrap();
+    let foo = addons.path().join("Foo");
+    std::fs::create_dir_all(&foo).unwrap();
+    std::fs::write(foo.join("Foo.toc"), "## Title: Foo\n## Version: 1\n").unwrap();
+    std::fs::write(foo.join("Core.lua"), "local x = 1\nprint(x)\nSendChatMessage('old', 'SAY')\n").unwrap();
+    std::fs::write(foo.join("Old.lua"), "-- going away\n").unwrap();
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut z = zip::ZipWriter::new(&mut buf);
+    let opt = zip::write::SimpleFileOptions::default();
+    for (name, body) in [
+        ("Foo/Foo.toc", "## Title: Foo\n## Version: 2\n"),
+        // Unchanged SendChatMessage isn't re-flagged; the new one is.
+        ("Foo/Core.lua", "local x = 2\nprint(x)\nSendChatMessage('old', 'SAY')\nSendChatMessage('buy gold at scam.example', 'GUILD')\n"),
+        ("Foo/New.lua", "local f = loadstring(blob)\n"),
+        ("Foo/helper.exe", "MZ fake program"),
+    ] {
+        z.start_file(name, opt).unwrap();
+        z.write_all(body.as_bytes()).unwrap();
+    }
+    z.finish().unwrap();
+    let stage = installer::stage(&buf.into_inner()).unwrap();
+
+    let r = crate::review::review(addons.path(), &stage, &["Foo".into()]);
+    let files: Vec<(&str, &str, usize, usize)> = r.files.iter().map(|f| (f.path.as_str(), f.status, f.added, f.removed)).collect();
+    assert_eq!(files, vec![
+        ("Foo/Core.lua", "modified", 2, 1),
+        ("Foo/Foo.toc", "modified", 1, 1),
+        ("Foo/helper.exe", "added", 1, 0),
+        ("Foo/New.lua", "added", 1, 0),
+        ("Foo/Old.lua", "removed", 0, 1),
+    ]);
+    assert_eq!(r.unchanged, 0);
+    let found: Vec<(&str, &str, Option<usize>)> = r.findings.iter().map(|f| (f.severity, f.path.as_str(), f.line)).collect();
+    assert_eq!(found, vec![
+        ("danger", "Foo/helper.exe", None),
+        ("warn", "Foo/Core.lua", Some(4)),
+        ("warn", "Foo/New.lua", Some(1)),
+    ]);
+    assert!(r.has_danger());
+    assert_eq!(crate::review::program_files(&stage), vec!["Foo/helper.exe"]);
+    assert!(crate::refuse_programs(&stage).is_err(), "plain Update refuses program files");
+
+    let d = crate::review::file_diff(addons.path(), &stage, &["Foo".into()], "Foo/Core.lua");
+    assert!(d.contains("--- a/Foo/Core.lua") && d.contains("+++ b/Foo/Core.lua"), "{d}");
+    assert!(d.contains("-local x = 1") && d.contains("+local x = 2") && d.contains("+SendChatMessage('buy gold"), "{d}");
+    let removed = crate::review::file_diff(addons.path(), &stage, &["Foo".into()], "Foo/Old.lua");
+    assert!(removed.contains("+++ /dev/null") && removed.contains("--- going away"), "{removed}");
 }
 
 #[test]
@@ -354,4 +426,55 @@ fn real_game_detection() {
     let g = crate::game::detect(std::path::Path::new(&dir));
     println!("{dir}: {g:?}");
     assert!(g.version.is_some());
+}
+
+fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut z = zip::ZipWriter::new(&mut buf);
+    for (name, body) in files {
+        z.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(body).unwrap();
+    }
+    z.finish().unwrap();
+    buf.into_inner()
+}
+
+#[test]
+fn refuses_unsafe_folder_names() {
+    // "...toc" names the folder "..": installing it would replace the Interface folder.
+    for toc in ["Evil/...toc", "Evil/..toc"] {
+        assert!(installer::stage(&zip_of(&[(toc, b"## Title: E\n")])).is_err(), "{toc}");
+    }
+    for bad in ["", ".", "..", "a/b", r"a\b", "C:", "Addon.", "Addon "] {
+        assert!(!installer::is_folder_name(bad), "{bad:?}");
+    }
+    assert!(installer::is_folder_name("BigWigs_Core"));
+    assert!(installer::is_folder_name("!BugGrabber"));
+}
+
+#[test]
+fn review_reads_code_with_nul_bytes() {
+    // A NUL in a comment must not turn a Lua file into "binary" that skips the checks.
+    let addons = tempfile::tempdir().unwrap();
+    let stage = installer::stage(&zip_of(&[
+        ("Foo/Foo.toc", b"## Title: Foo\n"),
+        ("Foo/Core.lua", b"-- \0\nSendChatMessage('hi', 'SAY')\n"),
+    ]))
+    .unwrap();
+    let r = crate::review::review(addons.path(), &stage, &[]);
+    assert!(r.files.iter().any(|f| f.path == "Foo/Core.lua" && !f.binary));
+    assert!(r.findings.iter().any(|f| f.path == "Foo/Core.lua" && f.severity == "warn"));
+}
+
+#[test]
+fn review_flags_unchanged_program_files() {
+    let addons = tempfile::tempdir().unwrap();
+    let foo = addons.path().join("Foo");
+    std::fs::create_dir_all(&foo).unwrap();
+    std::fs::write(foo.join("Foo.toc"), "## Title: Foo\n").unwrap();
+    std::fs::write(foo.join("run.exe"), "MZ").unwrap();
+    let stage = installer::stage(&zip_of(&[("Foo/Foo.toc", b"## Title: Foo\n"), ("Foo/run.exe", b"MZ")])).unwrap();
+    let r = crate::review::review(addons.path(), &stage, &["Foo".into()]);
+    assert!(r.has_danger());
 }

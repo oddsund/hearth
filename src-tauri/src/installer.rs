@@ -306,18 +306,39 @@ pub async fn install(
     install_bytes(addons_dir, id, &bytes, old_folders, None)
 }
 
+/// A zip unpacked into a temp folder, not installed yet: lets an update be checked and
+/// diffed before anything in AddOns changes. Dropping it deletes the temp folder.
+pub struct Stage {
+    _dir: tempfile::TempDir,
+    /// (folder name in AddOns, unpacked path)
+    pub folders: Vec<(String, PathBuf)>,
+}
+
+pub fn stage(bytes: &[u8]) -> Result<Stage> {
+    let tmp = tempfile::tempdir().context("Creating temp folder")?;
+    extract(bytes, tmp.path())?;
+    let folders = staged_folders(tmp.path())?;
+    Ok(Stage { _dir: tmp, folders })
+}
+
 /// Install from zip bytes already in memory (downloaded or a local file).
 /// `old_version` is recorded with the backup of the replaced folders, for roll back.
 pub fn install_bytes(addons_dir: &Path, id: &str, bytes: &[u8], old_folders: &[String], old_version: Option<&str>) -> Result<Vec<String>> {
     if !addons_dir.is_dir() {
         bail!("AddOns folder not found: {}. Check Settings.", addons_dir.display());
     }
-    let tmp = tempfile::tempdir().context("Creating temp folder")?;
-    extract(bytes, tmp.path())?;
-    let staged = staged_folders(tmp.path())?;
+    install_staged(addons_dir, id, stage(bytes)?, old_folders, old_version)
+}
+
+/// Swap an unpacked update into AddOns (backing up what it replaces).
+pub fn install_staged(addons_dir: &Path, id: &str, stage: Stage, old_folders: &[String], old_version: Option<&str>) -> Result<Vec<String>> {
+    if !addons_dir.is_dir() {
+        bail!("AddOns folder not found: {}. Check Settings.", addons_dir.display());
+    }
+    let staged = &stage.folders;
 
     let mut replace: Vec<String> = old_folders.to_vec();
-    for (name, _) in &staged {
+    for (name, _) in staged {
         if !replace.iter().any(|f| f.eq_ignore_ascii_case(name)) {
             replace.push(name.clone());
         }
@@ -326,7 +347,7 @@ pub fn install_bytes(addons_dir: &Path, id: &str, bytes: &[u8], old_folders: &[S
     let moved = backup_folders(addons_dir, id, &replace, old_version)?;
 
     let mut placed: Vec<PathBuf> = Vec::new();
-    for (name, src) in &staged {
+    for (name, src) in staged {
         let dst = addons_dir.join(name);
         if let Err(e) = move_dir(src, &dst) {
             for p in &placed {
@@ -340,5 +361,5 @@ pub fn install_bytes(addons_dir: &Path, id: &str, bytes: &[u8], old_folders: &[S
     }
 
     prune_backups(id);
-    Ok(staged.into_iter().map(|(n, _)| n).collect())
+    Ok(staged.iter().map(|(n, _)| n.clone()).collect())
 }

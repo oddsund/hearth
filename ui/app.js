@@ -230,7 +230,8 @@ function render() {
             ? jobButton("ln:" + a.id, `data-link="${esc(a.id)}"`, "Link", "primary")
             : a.pinned
               ? `<button class="small" data-pin="${esc(a.id)}" data-pin-to="0">Unpin</button>`
-              : jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "") +
+              : (u?.has_update && !jobs.has("up:" + a.id) ? `<button class="small ghost" data-diff="${esc(a.id)}" title="Look through what this update changes before installing it">Show diff</button> ` : "") +
+                jobButton("up:" + a.id, `data-update="${esc(a.id)}"`, u?.has_update ? "Update" : "Reinstall", u?.has_update ? "primary" : "") +
                 ` <button class="small ghost" data-pin="${esc(a.id)}" data-pin-to="1" title="Stay on ${esc(a.version)}: skip this addon when checking for and installing updates">Pin</button>`}
           ${a.id in rollbacks
             ? jobButton("rb:" + a.id, `data-rollback="${esc(a.id)}" title="Swap back to ${esc(rollbacks[a.id] || "the version Hearth replaced")}. You can roll forward again the same way."`,
@@ -266,7 +267,8 @@ function render() {
             ? jobButton("rm:" + r.link_provider + ":" + r.link_source,
                 `data-remote="${i}" title="Install the newest build for your game from ${esc(sourceLabel(r.link_provider, r.link_source))} instead of this zip"`,
                 "Get build for your game", "primary")
-            : jobButton("dl:" + r.path, `data-local="${i}"`, label[r.status], r.status === "new" ? "" : "primary")
+            : (jobs.has("dl:" + r.path) ? "" : `<button class="small ghost" data-diff-local="${i}" title="Look through this zip's changes before installing it">Show diff</button> `) +
+              jobButton("dl:" + r.path, `data-local="${i}"`, label[r.status], r.status === "new" ? "" : "primary")
         }</td>
       </tr>`;
     })
@@ -473,6 +475,127 @@ $("untracked").onclick = (e) => {
 };
 $("btn-adopt-all").onclick = () => run("Tracking", () => adoptGroupsNow([...adoptGroups])).then(autoCheck);
 
+// ---- Show diff: look through an update (git-style) before installing it
+let rv = null; // { token, name, from_version, to_version, review, jobKey }
+const RV_LETTER = { added: "A", removed: "D", modified: "M" };
+const RV_LABEL = { danger: "Blocked", warn: "Check", info: "Note" };
+
+function openReview(title, jobKey, load) {
+  const mine = { loading: true, jobKey };
+  if (rv?.token) invoke("discard_review", { token: rv.token }).catch(() => {});
+  rv = mine;
+  $("review").hidden = false;
+  $("rv-title").textContent = title;
+  $("rv-findings").innerHTML = "";
+  $("rv-files").innerHTML = "";
+  $("rv-summary").textContent = "Downloading and comparing with what's installed…";
+  $("rv-diff").innerHTML = "";
+  $("rv-install").disabled = true;
+  $("rv-install").textContent = "Install";
+  $("rv-note").textContent = "";
+  load
+    .then((r) => {
+      if (rv !== mine) return invoke("discard_review", { token: r.token }); // closed or replaced meanwhile
+      rv = { ...r, jobKey };
+      renderReview();
+      // Start where it matters: the first flagged file, else the first changed one.
+      const first = r.review.findings.find((f) => f.severity !== "info") ?? null;
+      showDiff(first?.path ?? r.review.files[0]?.path, first?.line);
+    })
+    .catch((e) => {
+      if (rv !== mine) return;
+      $("rv-summary").textContent = String(e);
+      rv = null;
+    });
+}
+
+function renderReview() {
+  const r = rv.review;
+  $("rv-title").textContent = `${rv.name}: ${rv.from_version ? shortVersion(rv.from_version) : "not installed"} → ${shortVersion(rv.to_version)}`;
+  $("rv-findings").innerHTML = r.findings.length
+    ? r.findings
+        .map((f) => `<button class="finding ${f.severity}" data-rv-path="${esc(f.path)}" data-rv-line="${f.line ?? ""}">
+            <strong>${RV_LABEL[f.severity]}:</strong> ${esc(f.message)}
+            <span class="where">${esc(f.path)}${f.line ? `:${f.line}` : ""}</span>
+            ${f.snippet ? `<code>${esc(f.snippet)}</code>` : ""}</button>`)
+        .join("")
+    : `<p class="muted">No checks were triggered by the new or changed code.</p>`;
+  const flagged = new Set(r.findings.filter((f) => f.severity !== "info").map((f) => f.path));
+  const add = r.files.reduce((n, f) => n + f.added, 0);
+  const del = r.files.reduce((n, f) => n + f.removed, 0);
+  $("rv-summary").innerHTML = `${r.files.length} file${r.files.length === 1 ? "" : "s"} changed,
+    <span class="num-add">+${add}</span> <span class="num-del">−${del}</span>${r.unchanged ? `, ${r.unchanged} unchanged` : ""}`;
+  $("rv-files").innerHTML = r.files
+    .map((f) => `<li data-rv-path="${esc(f.path)}" title="${esc(f.path)}">
+        <span class="st ${RV_LETTER[f.status]}">${RV_LETTER[f.status]}</span>
+        <span class="name">${esc(f.path)}</span>
+        ${flagged.has(f.path) ? `<span class="flag" title="Flagged by a check">⚑</span>` : ""}
+        ${f.binary ? `<span class="muted">bin</span>` : `<span class="num-add">+${f.added}</span><span class="num-del">−${f.removed}</span>`}
+      </li>`)
+    .join("");
+  const danger = r.findings.some((f) => f.severity === "danger");
+  $("rv-install").disabled = false;
+  $("rv-install").textContent = danger ? "Install anyway…" : "Install";
+  $("rv-note").textContent = danger ? "Contains Windows program files; normal Update refuses this." : "";
+}
+
+async function showDiff(path, line) {
+  if (!path || !rv?.token) return;
+  document.querySelectorAll("#rv-files li").forEach((li) => li.classList.toggle("sel", li.dataset.rvPath === path));
+  $("rv-diff").textContent = "Loading…";
+  let text;
+  try { text = await invoke("review_file", { token: rv.token, path }); }
+  catch (e) { $("rv-diff").textContent = String(e); return; }
+  const MAX = 20000;
+  const lines = text.split("\n");
+  let newNo = 0, hit = null;
+  const html = lines.slice(0, MAX).map((l) => {
+    let cls = "", no = null;
+    if (l.startsWith("+++") || l.startsWith("---")) cls = "meta";
+    else if (l.startsWith("@@")) { cls = "hunk"; newNo = Number(/\+(\d+)/.exec(l)?.[1] ?? 0); }
+    else if (l.startsWith("+")) { cls = "add"; no = newNo++; }
+    else if (l.startsWith("-")) cls = "del";
+    else if (l.startsWith(" ")) no = newNo++;
+    const isHit = line && no === line;
+    return `<span class="${cls}${isHit ? " hit" : ""}"${isHit ? ' id="rv-hit"' : ""}>${esc(l) || " "}</span>`;
+  });
+  if (lines.length > MAX) html.push(`<span class="meta">… ${lines.length - MAX} more lines not shown</span>`);
+  $("rv-diff").innerHTML = html.join("");
+  (hit = document.getElementById("rv-hit")) ? hit.scrollIntoView({ block: "center" }) : ($("rv-diff").scrollTop = 0);
+}
+
+function closeReview(discard = true) {
+  if (discard && rv?.token) invoke("discard_review", { token: rv.token }).catch(() => {});
+  rv = null;
+  $("review").hidden = true;
+}
+
+$("rv-findings").onclick = (e) => {
+  const b = e.target.closest("[data-rv-path]");
+  if (b) showDiff(b.dataset.rvPath, Number(b.dataset.rvLine) || null);
+};
+$("rv-files").onclick = (e) => {
+  const li = e.target.closest("[data-rv-path]");
+  if (li) showDiff(li.dataset.rvPath);
+};
+$("rv-close").onclick = $("rv-cancel").onclick = () => closeReview();
+document.addEventListener("keydown", (e) => e.key === "Escape" && !$("review").hidden && closeReview());
+$("rv-install").onclick = () => {
+  const r = rv;
+  if (!r?.token) return;
+  const danger = r.review.findings.some((f) => f.severity === "danger");
+  if (danger && !confirm(
+    `${r.name} contains files that can run on Windows:\n\n${r.review.findings.filter((f) => f.severity === "danger").map((f) => f.path).join("\n")}\n\n` +
+      "WoW never runs these and addons don't need them. Install anyway?")) return;
+  closeReview(false);
+  enqueue(r.jobKey, r.name, async () => {
+    const a = await invoke("apply_review", { token: r.token, allowPrograms: danger });
+    delete updates[a.id];
+    delete notes[a.id];
+    return `${a.name} ${a.version} (reviewed)`;
+  });
+};
+
 $("btn-export").onclick = () =>
   run("Exporting", async () => {
     const path = await invoke("export_list");
@@ -517,6 +640,11 @@ const sourceUrl = (provider, source) =>
   provider === "wowi" ? `https://www.wowinterface.com/downloads/info${source}` : source; // github: owner/repo, curse: id
 
 $("downloads").onclick = (e) => {
+  const di = e.target.closest("[data-diff-local]")?.dataset.diffLocal;
+  if (di !== undefined) {
+    const r = actionableRows[Number(di)];
+    return openReview(`${r.main.title}: ${r.file_name}`, "dl:" + r.path, invoke("review_local", { path: r.path }));
+  }
   const ri = e.target.closest("[data-remote]")?.dataset.remote;
   if (ri !== undefined) {
     const r = actionableRows[Number(ri)];
@@ -587,6 +715,11 @@ $("tracked").onclick = (e) => {
     });
   }
   if (up) enqueueUpdate(up);
+  const df = e.target.closest("[data-diff]")?.dataset.diff;
+  if (df) {
+    const a = state.addons.find((x) => x.id === df);
+    openReview(`${a?.name ?? df}: checking the update…`, "up:" + df, invoke("review_update", { id: df }));
+  }
   const depZip = e.target.closest("[data-dep-zip]");
   if (depZip) {
     const path = depZip.dataset.depZip;

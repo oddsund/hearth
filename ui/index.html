@@ -104,6 +104,28 @@
     <p class="muted">Tracking only records what's there; nothing is downloaded. Online addons get updates from then on, manual ones can be linked.</p>
   </section>
 
+  <div id="review" class="overlay" hidden>
+    <div class="review-box" role="dialog" aria-labelledby="rv-title">
+      <div class="card-head">
+        <h2 id="rv-title">Show diff</h2>
+        <button id="rv-close" class="small ghost" title="Close without installing">✕</button>
+      </div>
+      <div id="rv-findings"></div>
+      <div class="rv-body">
+        <div class="rv-side">
+          <div class="muted" id="rv-summary"></div>
+          <ul id="rv-files"></ul>
+        </div>
+        <pre id="rv-diff" class="diff"></pre>
+      </div>
+      <div class="row rv-actions">
+        <button id="rv-install" class="primary">Install</button>
+        <button id="rv-cancel">Cancel</button>
+        <span id="rv-note" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
   <div id="status" role="status"></div>
 
   <script src="app.js"></script>
