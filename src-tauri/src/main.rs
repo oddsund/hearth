@@ -238,10 +238,9 @@ struct Fetched {
 /// The state lock is NOT held while talking to the network, so several installs download in
 /// parallel; only the folder swap + state write is serialized.
 async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Result<TrackedAddon> {
-    let f = fetch(ctx, o).await?;
-    let stage = installer::stage(&f.bytes)?;
-    refuse_programs(&stage)?;
-    apply_stage(ctx, f.o, f.version, stage, extra_old, f.replaced_id).await
+    let Fetched { o, version, bytes, replaced_id } = fetch(ctx, o).await?;
+    let stage = stage_bytes(bytes, true).await?;
+    apply_stage(ctx, o, version, stage, extra_old, replaced_id).await
 }
 
 /// Plain Update/Install refuses updates that ship Windows program files; Show diff lets you decide.
@@ -276,9 +275,48 @@ async fn apply_stage(
         }
     }
     let old_version = tracked_version(&st, &id, &old);
-    protect_settings(Path::new(&st.addons_dir));
-    let folders = installer::install_staged(Path::new(&st.addons_dir), &id, stage, &old, old_version.as_deref())?;
+    let addons_dir = PathBuf::from(&st.addons_dir);
+    // The lock stays held (swaps happen one at a time), but the disk work runs off the async threads.
+    let folders = blocking(move || {
+        protect_settings(&addons_dir);
+        installer::install_staged(&addons_dir, &id, stage, &old, old_version.as_deref())
+    })
+    .await??;
     record(&mut st, o, version, folders)
+}
+
+/// Run disk work (unzipping, moving folders, zipping WTF) on a blocking thread, so a slow disk
+/// never stalls the async threads that serve the UI and run the other downloads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow::anyhow!("Background task failed: {e}"))
+}
+
+/// Unzip downloaded bytes into a temp folder, off the async threads. `refuse` = plain
+/// Install/Update, which turns down zips with Windows programs (Show diff lets you decide).
+async fn stage_bytes(bytes: Vec<u8>, refuse: bool) -> anyhow::Result<installer::Stage> {
+    blocking(move || {
+        let stage = installer::stage(&bytes)?;
+        if refuse {
+            refuse_programs(&stage)?;
+        }
+        Ok(stage)
+    })
+    .await?
+}
+
+/// Read and unzip an addon zip from Downloads, off the async threads.
+async fn stage_local(path: String, refuse: bool) -> Res<(toc::TocInfo, installer::Stage)> {
+    let p = PathBuf::from(&path);
+    let (info, bytes) = blocking(move || {
+        let (_, info) = downloads::inspect(&p).ok_or_else(|| format!("{path} isn't an addon zip"))?;
+        let bytes = std::fs::read(&p).map_err(|e| format!("Reading {path}: {e}"))?;
+        Ok::<_, String>((info, bytes))
+    })
+    .await
+    .map_err(err)??;
+    Ok((info, stage_bytes(bytes, refuse).await.map_err(err)?))
 }
 
 /// Find and download the newest build (with the WoWInterface -> CurseForge fallback).
@@ -391,15 +429,18 @@ async fn save_settings(
 
 #[tauri::command]
 async fn scan(ctx: tauri::State<'_, Ctx>) -> Res<Vec<ScanRow>> {
-    let st = ctx.state.lock().await;
-    let rows = toc::scan(Path::new(&st.addons_dir))
-        .into_iter()
-        .map(|t| {
-            let tracked_by = tracked_owner(&st, &t.folder).map(|a| a.id.clone());
-            ScanRow { toc: t, tracked_by }
-        })
-        .collect();
-    Ok(rows)
+    let st = ctx.state.lock().await.clone();
+    blocking(move || {
+        toc::scan(Path::new(&st.addons_dir))
+            .into_iter()
+            .map(|t| {
+                let tracked_by = tracked_owner(&st, &t.folder).map(|a| a.id.clone());
+                ScanRow { toc: t, tracked_by }
+            })
+            .collect()
+    })
+    .await
+    .map_err(err)
 }
 
 #[tauri::command]
@@ -466,7 +507,8 @@ async fn missing_dependencies(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DepReport>>
 
 #[tauri::command]
 async fn adoptable_addons(ctx: tauri::State<'_, Ctx>) -> Res<Vec<AdoptGroup>> {
-    Ok(adoptable(&*ctx.state.lock().await))
+    let st = ctx.state.lock().await.clone();
+    blocking(move || adoptable(&st)).await.map_err(err)
 }
 
 /// Start tracking folders that are already installed. Nothing is downloaded or moved.
@@ -518,11 +560,7 @@ async fn downloads_signature(ctx: tauri::State<'_, Ctx>) -> Res<String> {
 
 #[tauri::command]
 async fn install_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<TrackedAddon> {
-    let p = PathBuf::from(&path);
-    let (_, info) = downloads::inspect(&p).ok_or_else(|| format!("{path} isn't an addon zip"))?;
-    let bytes = std::fs::read(&p).map_err(|e| format!("Reading {path}: {e}"))?;
-    let stage = installer::stage(&bytes).map_err(err)?;
-    refuse_programs(&stage).map_err(err)?;
+    let (info, stage) = stage_local(path, true).await?;
     let o = origin_for(&*ctx.state.lock().await, &info);
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
     apply_stage(ctx.inner(), o, version, stage, &[], None).await.map_err(err)
@@ -593,18 +631,15 @@ async fn review_update(ctx: tauri::State<'_, Ctx>, id: String) -> Res<ReviewOut>
         st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
     };
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    let f = fetch(ctx.inner(), o).await.map_err(err)?;
-    let stage = installer::stage(&f.bytes).map_err(err)?;
-    start_review(ctx.inner(), a.name, Some(a.version), f.o, f.version, stage, f.replaced_id).await
+    let Fetched { o, version, bytes, replaced_id } = fetch(ctx.inner(), o).await.map_err(err)?;
+    let stage = stage_bytes(bytes, false).await.map_err(err)?;
+    start_review(ctx.inner(), a.name, Some(a.version), o, version, stage, replaced_id).await
 }
 
 /// Review a zip from Downloads against what's installed.
 #[tauri::command]
 async fn review_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<ReviewOut> {
-    let p = PathBuf::from(&path);
-    let (_, info) = downloads::inspect(&p).ok_or_else(|| format!("{path} isn't an addon zip"))?;
-    let bytes = std::fs::read(&p).map_err(|e| format!("Reading {path}: {e}"))?;
-    let stage = installer::stage(&bytes).map_err(err)?;
+    let (info, stage) = stage_local(path, false).await?;
     let (o, from) = {
         let st = ctx.state.lock().await;
         let from = toc::read_info(&Path::new(&st.addons_dir).join(&info.folder)).and_then(|i| i.version);
@@ -723,8 +758,14 @@ async fn update_addon(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddo
 async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
     let mut st = ctx.state.lock().await;
     let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
-    protect_settings(Path::new(&st.addons_dir));
-    installer::backup_folders(Path::new(&st.addons_dir), &a.id, &a.folders, Some(&a.version)).map_err(err)?;
+    let addons_dir = PathBuf::from(&st.addons_dir);
+    blocking(move || {
+        protect_settings(&addons_dir);
+        installer::backup_folders(&addons_dir, &a.id, &a.folders, Some(&a.version))
+    })
+    .await
+    .and_then(|r| r)
+    .map_err(err)?;
     st.addons.retain(|x| x.id != id);
     st.save().map_err(err)?;
     Ok(())
@@ -874,9 +915,15 @@ async fn rollback_options(ctx: tauri::State<'_, Ctx>) -> Res<std::collections::H
 async fn roll_back(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> {
     let mut st = ctx.state.lock().await;
     let addons_dir = PathBuf::from(&st.addons_dir);
-    protect_settings(&addons_dir);
+    let cur = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
+    let meta = blocking(move || {
+        protect_settings(&addons_dir);
+        installer::roll_back(&addons_dir, &cur.id, &cur.folders, &cur.version)
+    })
+    .await
+    .and_then(|r| r)
+    .map_err(err)?;
     let a = st.addons.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("{id} isn't tracked"))?;
-    let meta = installer::roll_back(&addons_dir, &a.id, &a.folders, &a.version).map_err(err)?;
     a.version = meta.version.unwrap_or_else(|| "previous".into());
     a.folders = meta.folders;
     a.installed_at = installer::now();
