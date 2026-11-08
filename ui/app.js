@@ -753,6 +753,15 @@ $("tracked").onclick = (e) => {
 (async () => {
   try {
     $("backup-loc").textContent = "Backups: " + (await invoke("backup_location"));
+    try {
+      const b = await invoke("build_info");
+      const id = `v${b.version} · ${b.commit}${b.dirty ? "-dirty" : ""}`;
+      const built = new Date(b.built_at * 1000).toLocaleString();
+      $("build-id").textContent = id;
+      $("build-id").classList.toggle("dirty", b.dirty);
+      $("build-id").title = `Built ${built}${b.dirty ? " from changes that aren't committed yet" : ` from commit ${b.commit}`}`;
+      $("build-full").textContent = `Build: ${id}, built ${built}${b.dirty ? " (includes uncommitted changes)" : ""}`;
+    } catch (_) {}
     await refresh();
     if (state.addons_dir) status("Ready. AddOns: " + state.addons_dir);
     await autoCheck();

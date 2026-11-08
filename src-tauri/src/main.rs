@@ -914,6 +914,26 @@ fn open_url(url: String) -> Res<()> {
     spawn.map(|_| ()).map_err(|e| format!("Couldn't open the browser: {e}"))
 }
 
+/// What build this is (see build.rs).
+#[derive(Serialize)]
+struct BuildInfo {
+    version: &'static str,
+    commit: &'static str,
+    /// Built from uncommitted changes: not exactly what's on GitHub.
+    dirty: bool,
+    built_at: u64,
+}
+
+#[tauri::command]
+fn build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        commit: env!("HEARTH_COMMIT"),
+        dirty: env!("HEARTH_DIRTY") == "true",
+        built_at: env!("HEARTH_BUILT").parse().unwrap_or(0),
+    }
+}
+
 #[tauri::command]
 fn backup_location() -> String {
     state::data_dir().join("backup").to_string_lossy().into_owned()
@@ -1027,6 +1047,7 @@ fn main() {
             backup_settings_now,
             restore_settings,
             open_url,
+            build_info,
             backup_location
         ])
         .run(tauri::generate_context!())

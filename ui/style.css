@@ -34,6 +34,8 @@ body {
 }
 header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 h1 { margin: 0; font-size: 20px; letter-spacing: .3px; }
+h1 .build { font: 12px Consolas, monospace; color: var(--muted); font-weight: normal; margin-left: 6px; user-select: text; }
+h1 .build.dirty { color: var(--accent); }
 h2 { margin: 0 0 10px; font-size: 15px; }
 .actions, .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .row input { flex: 1; min-width: 200px; }
