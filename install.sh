@@ -15,7 +15,13 @@ install -Dm644 icons/icon.png /usr/share/icons/hicolor/256x256/apps/hearth.png
 # Launcher with the env WebKitGTK needs under WSLg.
 cat > /usr/local/bin/hearth <<'EOF'
 #!/usr/bin/env bash
-export WEBKIT_DISABLE_DMABUF_RENDERER=1
+# With WSL's GPU (/dev/dxg), draw on it through Mesa's d3d12 driver: smooth scrolling.
+# Without it, WebKit's GPU renderer can show a blank window, so let it draw on the CPU.
+if [ -e /dev/dxg ]; then
+  export GALLIUM_DRIVER=d3d12
+else
+  export WEBKIT_DISABLE_DMABUF_RENDERER=1
+fi
 exec /usr/local/lib/hearth/hearth "$@"
 EOF
 chmod 755 /usr/local/bin/hearth

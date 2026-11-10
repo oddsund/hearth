@@ -6,6 +6,11 @@ set -euo pipefail
 . "$HOME/.cargo/env"
 cd "$(dirname "$(readlink -f "$0")")/src-tauri"
 export CARGO_TARGET_DIR="$HOME/hearth-target"
-# WebKitGTK under WSLg can render a blank window with the DMA-BUF renderer.
-export WEBKIT_DISABLE_DMABUF_RENDERER=1
+# Draw on WSL's GPU through Mesa's d3d12 driver. Without one, WebKit's GPU renderer can show
+# a blank window under WSLg, so draw on the CPU instead (works, but scrolling lags).
+if [ -e /dev/dxg ]; then
+  export GALLIUM_DRIVER=d3d12
+else
+  export WEBKIT_DISABLE_DMABUF_RENDERER=1
+fi
 exec cargo run "$@"
