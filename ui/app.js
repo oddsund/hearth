@@ -187,24 +187,36 @@ function jobText(j) {
   return t;
 }
 
-/** The "In progress" card: every queued or running install, with a progress bar. */
+/** The "In progress" card: every queued or running install, with a progress bar.
+ *  Rows stay in place and only their text and bar change, so the bar glides between
+ *  updates and busy bars keep animating instead of restarting on every redraw. */
+const jobRows = new Map(); // key -> { tr, text, meter, fill }
 function renderJobs() {
-  const list = [...jobs.values()];
-  $("jobs-card").hidden = !list.length;
-  $("jobs").innerHTML = list
-    .map((j) => {
-      const queued = j.state === "queued";
-      const pct = !queued && j.phase === "downloading" && j.total ? Math.min(100, Math.round((100 * j.done) / j.total)) : null;
-      // No value = an animated "busy" bar for steps without a known size.
-      const bar = queued ? `<progress max="100" value="0"></progress>`
-        : pct == null ? `<progress></progress>` : `<progress max="100" value="${pct}"></progress>`;
-      return `<tr>
-        <td><strong>${esc(j.label)}</strong></td>
-        <td class="muted">${esc(queued ? "Queued, waiting for a free slot" : jobText(j))}</td>
-        <td class="meter-cell">${bar}</td>
-      </tr>`;
-    })
-    .join("");
+  $("jobs-card").hidden = !jobs.size;
+  for (const [key, r] of jobRows) {
+    if (!jobs.has(key)) {
+      r.tr.remove();
+      jobRows.delete(key);
+    }
+  }
+  for (const [key, j] of jobs) {
+    let r = jobRows.get(key);
+    if (!r) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td><strong>${esc(j.label)}</strong></td><td class="muted"></td>
+        <td class="meter-cell"><div class="meter"><div class="fill"></div></div></td>`;
+      $("jobs").append(tr);
+      r = { tr, text: tr.children[1], meter: tr.querySelector(".meter"), fill: tr.querySelector(".fill") };
+      jobRows.set(key, r);
+    }
+    const queued = j.state === "queued";
+    const text = queued ? "Queued, waiting for a free slot" : jobText(j);
+    if (r.text.textContent !== text) r.text.textContent = text;
+    const frac = !queued && j.phase === "downloading" && j.total ? Math.min(1, j.done / j.total) : null;
+    // Steps without a known size get an animated "busy" bar.
+    r.meter.classList.toggle("busy", !queued && frac == null);
+    r.fill.style.transform = `scaleX(${frac ?? 0})`;
+  }
 }
 
 window.__TAURI__.event.listen("job-progress", ({ payload: p }) => {
