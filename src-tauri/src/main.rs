@@ -45,6 +45,49 @@ struct Pending {
 
 type Res<T> = Result<T, String>;
 
+/// Tells the UI how far one install has come ("job-progress" events), keyed by the UI's job id.
+/// Without a job id (older callers) it stays silent.
+struct Progress(Option<(tauri::AppHandle, String)>);
+
+#[derive(Serialize, Clone)]
+struct ProgressEvent<'a> {
+    job: &'a str,
+    /// "checking" | "downloading" | "unpacking" | "comparing" | "installing"
+    phase: &'a str,
+    version: Option<&'a str>,
+    done: u64,
+    total: Option<u64>,
+}
+
+impl Progress {
+    fn new(app: tauri::AppHandle, job: Option<String>) -> Self {
+        Progress(job.map(|j| (app, j)))
+    }
+
+    fn phase(&self, phase: &str) {
+        self.send(phase, None, 0, None);
+    }
+
+    fn send(&self, phase: &str, version: Option<&str>, done: u64, total: Option<u64>) {
+        use tauri::Emitter;
+        if let Some((app, job)) = &self.0 {
+            let _ = app.emit("job-progress", ProgressEvent { job, phase, version, done, total });
+        }
+    }
+
+    /// Download callback: reports bytes at most ~7 times a second, plus the last chunk.
+    fn download_meter<'a>(&'a self, version: &'a str) -> impl FnMut(u64, Option<u64>) + Send + 'a {
+        let mut last: Option<std::time::Instant> = None;
+        move |done, total| {
+            let finished = total == Some(done);
+            if finished || last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(150)) {
+                last = Some(std::time::Instant::now());
+                self.send("downloading", Some(version), done, total);
+            }
+        }
+    }
+}
+
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
@@ -237,10 +280,10 @@ struct Fetched {
 /// Install/update from an online source. `extra_old` = folders of another entry being replaced.
 /// The state lock is NOT held while talking to the network, so several installs download in
 /// parallel; only the folder swap + state write is serialized.
-async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String]) -> anyhow::Result<TrackedAddon> {
-    let Fetched { o, version, bytes, replaced_id } = fetch(ctx, o).await?;
-    let stage = stage_bytes(bytes, true).await?;
-    apply_stage(ctx, o, version, stage, extra_old, replaced_id).await
+async fn do_install(ctx: &Ctx, o: Origin, extra_old: &[String], p: &Progress) -> anyhow::Result<TrackedAddon> {
+    let Fetched { o, version, bytes, replaced_id } = fetch(ctx, o, p).await?;
+    let stage = stage_bytes(bytes, true, p).await?;
+    apply_stage(ctx, o, version, stage, extra_old, replaced_id, p).await
 }
 
 /// Plain Update/Install refuses updates that ship Windows program files; Show diff lets you decide.
@@ -264,8 +307,10 @@ async fn apply_stage(
     stage: installer::Stage,
     extra_old: &[String],
     replaced_id: Option<String>,
+    p: &Progress,
 ) -> anyhow::Result<TrackedAddon> {
     let id = o.id();
+    p.phase("installing");
     let mut st = ctx.state.lock().await;
     let mut old = old_folders(&st, &id);
     let replaced = replaced_id.as_deref().map(|r| old_folders(&st, r)).unwrap_or_default();
@@ -295,7 +340,8 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 /// Unzip downloaded bytes into a temp folder, off the async threads. `refuse` = plain
 /// Install/Update, which turns down zips with Windows programs (Show diff lets you decide).
-async fn stage_bytes(bytes: Vec<u8>, refuse: bool) -> anyhow::Result<installer::Stage> {
+async fn stage_bytes(bytes: Vec<u8>, refuse: bool, p: &Progress) -> anyhow::Result<installer::Stage> {
+    p.phase("unpacking");
     blocking(move || {
         let stage = installer::stage(&bytes)?;
         if refuse {
@@ -307,7 +353,7 @@ async fn stage_bytes(bytes: Vec<u8>, refuse: bool) -> anyhow::Result<installer::
 }
 
 /// Read and unzip an addon zip from Downloads, off the async threads.
-async fn stage_local(path: String, refuse: bool) -> Res<(toc::TocInfo, installer::Stage)> {
+async fn stage_local(path: String, refuse: bool, progress: &Progress) -> Res<(toc::TocInfo, installer::Stage)> {
     let p = PathBuf::from(&path);
     let (info, bytes) = blocking(move || {
         let (_, info) = downloads::inspect(&p).ok_or_else(|| format!("{path} isn't an addon zip"))?;
@@ -316,11 +362,12 @@ async fn stage_local(path: String, refuse: bool) -> Res<(toc::TocInfo, installer
     })
     .await
     .map_err(err)??;
-    Ok((info, stage_bytes(bytes, refuse).await.map_err(err)?))
+    Ok((info, stage_bytes(bytes, refuse, progress).await.map_err(err)?))
 }
 
 /// Find and download the newest build (with the WoWInterface -> CurseForge fallback).
-async fn fetch(ctx: &Ctx, o: Origin) -> anyhow::Result<Fetched> {
+async fn fetch(ctx: &Ctx, o: Origin, p: &Progress) -> anyhow::Result<Fetched> {
+    p.phase("checking");
     if o.provider == "local" {
         anyhow::bail!("Installed from a zip with no online source. Use Link to connect it to GitHub, WoWInterface or CurseForge.");
     }
@@ -335,7 +382,8 @@ async fn fetch(ctx: &Ctx, o: Origin) -> anyhow::Result<Fetched> {
     let mut o = o;
     let mut replaced_id: Option<String> = None;
     let mut rel = providers::latest(&ctx.client, token.as_deref(), &o.provider, &o.source, o.asset_pattern.as_deref(), &game).await?;
-    let bytes = match installer::download(&ctx.client, &rel.download_url).await {
+    let first = installer::download_with(&ctx.client, &rel.download_url, p.download_meter(&rel.version)).await;
+    let bytes = match first {
         Ok(b) => b,
         // WoWInterface now answers app downloads with a "log in" page. Use CurseForge instead
         // when the addon is known there, and switch its updates to CurseForge.
@@ -357,7 +405,7 @@ async fn fetch(ctx: &Ctx, o: Origin) -> anyhow::Result<Fetched> {
             rel = providers::latest(&ctx.client, None, &curse.provider, &curse.source, None, &game)
                 .await
                 .context("WoWInterface refused the download, and CurseForge has no build for this game either")?;
-            let b = installer::download(&ctx.client, &rel.download_url).await?;
+            let b = installer::download_with(&ctx.client, &rel.download_url, p.download_meter(&rel.version)).await?;
             replaced_id = Some(o.id());
             o = curse;
             b
@@ -559,11 +607,12 @@ async fn downloads_signature(ctx: tauri::State<'_, Ctx>) -> Res<String> {
 }
 
 #[tauri::command]
-async fn install_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<TrackedAddon> {
-    let (info, stage) = stage_local(path, true).await?;
+async fn install_local(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, path: String, job: Option<String>) -> Res<TrackedAddon> {
+    let p = Progress::new(app, job);
+    let (info, stage) = stage_local(path, true, &p).await?;
     let o = origin_for(&*ctx.state.lock().await, &info);
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
-    apply_stage(ctx.inner(), o, version, stage, &[], None).await.map_err(err)
+    apply_stage(ctx.inner(), o, version, stage, &[], None, &p).await.map_err(err)
 }
 
 // ---- Show diff: unpack an update, compare it with what's installed, then install or cancel.
@@ -625,21 +674,25 @@ async fn start_review(
 
 /// Download a tracked addon's update and review it without installing.
 #[tauri::command]
-async fn review_update(ctx: tauri::State<'_, Ctx>, id: String) -> Res<ReviewOut> {
+async fn review_update(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, id: String, job: Option<String>) -> Res<ReviewOut> {
+    let p = Progress::new(app, job);
     let a = {
         let st = ctx.state.lock().await;
         st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
     };
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    let Fetched { o, version, bytes, replaced_id } = fetch(ctx.inner(), o).await.map_err(err)?;
-    let stage = stage_bytes(bytes, false).await.map_err(err)?;
+    let Fetched { o, version, bytes, replaced_id } = fetch(ctx.inner(), o, &p).await.map_err(err)?;
+    let stage = stage_bytes(bytes, false, &p).await.map_err(err)?;
+    p.phase("comparing");
     start_review(ctx.inner(), a.name, Some(a.version), o, version, stage, replaced_id).await
 }
 
 /// Review a zip from Downloads against what's installed.
 #[tauri::command]
-async fn review_local(ctx: tauri::State<'_, Ctx>, path: String) -> Res<ReviewOut> {
-    let (info, stage) = stage_local(path, false).await?;
+async fn review_local(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, path: String, job: Option<String>) -> Res<ReviewOut> {
+    let p = Progress::new(app, job);
+    let (info, stage) = stage_local(path, false, &p).await?;
+    p.phase("comparing");
     let (o, from) = {
         let st = ctx.state.lock().await;
         let from = toc::read_info(&Path::new(&st.addons_dir).join(&info.folder)).and_then(|i| i.version);
@@ -660,7 +713,13 @@ async fn review_file(ctx: tauri::State<'_, Ctx>, token: String, path: String) ->
 
 /// Install a reviewed update. `allow_programs` = the user saw the program-file warning and said yes.
 #[tauri::command]
-async fn apply_review(ctx: tauri::State<'_, Ctx>, token: String, allow_programs: bool) -> Res<TrackedAddon> {
+async fn apply_review(
+    app: tauri::AppHandle,
+    ctx: tauri::State<'_, Ctx>,
+    token: String,
+    allow_programs: bool,
+    job: Option<String>,
+) -> Res<TrackedAddon> {
     let p = {
         let mut pending = ctx.reviews.lock().unwrap_or_else(|e| e.into_inner());
         let p = pending.remove(&token).ok_or("This review has expired. Open Show diff again.")?;
@@ -670,7 +729,8 @@ async fn apply_review(ctx: tauri::State<'_, Ctx>, token: String, allow_programs:
         }
         p
     };
-    apply_stage(ctx.inner(), p.origin, p.version, p.stage, &[], p.replaced_id).await.map_err(err)
+    let progress = Progress::new(app, job);
+    apply_stage(ctx.inner(), p.origin, p.version, p.stage, &[], p.replaced_id, &progress).await.map_err(err)
 }
 
 #[tauri::command]
@@ -679,7 +739,13 @@ fn discard_review(ctx: tauri::State<'_, Ctx>, token: String) {
 }
 
 #[tauri::command]
-async fn install(ctx: tauri::State<'_, Ctx>, url: String, asset_pattern: Option<String>) -> Res<TrackedAddon> {
+async fn install(
+    app: tauri::AppHandle,
+    ctx: tauri::State<'_, Ctx>,
+    url: String,
+    asset_pattern: Option<String>,
+    job: Option<String>,
+) -> Res<TrackedAddon> {
     let p = providers::parse_url(&url).map_err(err)?;
     let o = Origin {
         provider: p.provider.into(),
@@ -688,12 +754,18 @@ async fn install(ctx: tauri::State<'_, Ctx>, url: String, asset_pattern: Option<
         asset_pattern: asset_pattern.filter(|s| !s.trim().is_empty()),
         curse_id: None,
     };
-    do_install(ctx.inner(), o, &[]).await.map_err(err)
+    do_install(ctx.inner(), o, &[], &Progress::new(app, job)).await.map_err(err)
 }
 
 /// Connect an addon (usually a manual one) to an online source and install the latest from there.
 #[tauri::command]
-async fn link_addon(ctx: tauri::State<'_, Ctx>, id: String, source: String) -> Res<TrackedAddon> {
+async fn link_addon(
+    app: tauri::AppHandle,
+    ctx: tauri::State<'_, Ctx>,
+    id: String,
+    source: String,
+    job: Option<String>,
+) -> Res<TrackedAddon> {
     let p = providers::parse_url(&source).map_err(err)?;
     let old = {
         let st = ctx.state.lock().await;
@@ -701,7 +773,7 @@ async fn link_addon(ctx: tauri::State<'_, Ctx>, id: String, source: String) -> R
     };
     let curse_id = if p.provider == "curse" { Some(p.source.clone()) } else { old.curse_id.clone() };
     let o = Origin { provider: p.provider.into(), source: p.source, url: p.url, asset_pattern: None, curse_id };
-    let new = do_install(ctx.inner(), o, &old.folders).await.map_err(err)?;
+    let new = do_install(ctx.inner(), o, &old.folders, &Progress::new(app, job)).await.map_err(err)?;
     if new.id != old.id {
         // Its folders were backed up/replaced by the install above.
         let mut st = ctx.state.lock().await;
@@ -759,13 +831,13 @@ async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
 }
 
 #[tauri::command]
-async fn update_addon(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> {
+async fn update_addon(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, id: String, job: Option<String>) -> Res<TrackedAddon> {
     let a = {
         let st = ctx.state.lock().await;
         st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
     };
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    do_install(ctx.inner(), o, &[]).await.map_err(err)
+    do_install(ctx.inner(), o, &[], &Progress::new(app, job)).await.map_err(err)
 }
 
 /// Moves the addon's folders to the backup area (not a hard delete) and stops tracking it.

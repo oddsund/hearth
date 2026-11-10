@@ -33,6 +33,15 @@ impl std::error::Error for NotAZip {}
 const MAX_DOWNLOAD: usize = 500 << 20;
 
 pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    download_with(client, url, |_, _| {}).await
+}
+
+/// `on_progress(bytes so far, total size if the server said)` runs after every chunk.
+pub async fn download_with(
+    client: &reqwest::Client,
+    url: &str,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>> {
     let mut resp = client
         .get(url)
         .send()
@@ -45,12 +54,15 @@ pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/html"));
+    let total = resp.content_length();
     let mut bytes = Vec::new();
+    on_progress(0, total);
     while let Some(chunk) = resp.chunk().await.context("Download failed")? {
         if bytes.len() + chunk.len() > MAX_DOWNLOAD {
             bail!("The download is bigger than 500 MB; refusing it ({url})");
         }
         bytes.extend_from_slice(&chunk);
+        on_progress(bytes.len() as u64, total);
     }
     // Every zip starts with "PK". Catch web pages here instead of failing later in the unzip.
     if html || !bytes.starts_with(b"PK") {

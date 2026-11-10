@@ -78,7 +78,9 @@ async function run(label, fn) {
 
 // ---- Install queue: click as many as you like; up to MAX_PARALLEL run at once.
 const MAX_PARALLEL = 4;
-const jobs = new Map(); // key -> "queued" | "running"
+// key -> { state: "queued" | "running", label, phase, version, done, total }. The backend fills in
+// phase/version/done/total through "job-progress" events tagged with the key.
+const jobs = new Map();
 const queue = [];
 let running = 0;
 let results = []; // finished since the queue was last empty
@@ -106,10 +108,11 @@ async function askWowGate() {
   return ok;
 }
 
-/** fn resolves to a success message. Keys stop the same thing being queued twice. */
+/** fn(job) resolves to a success message; pass `job` to the backend so it can report progress.
+ *  Keys stop the same thing being queued twice. */
 async function enqueue(key, label, fn) {
   if (jobs.has(key)) return;
-  jobs.set(key, "queued");
+  jobs.set(key, { state: "queued", label });
   render();
   if (!(await wowGate())) {
     jobs.delete(key);
@@ -122,12 +125,13 @@ async function enqueue(key, label, fn) {
 }
 
 function pump() {
+  const started = running < MAX_PARALLEL && queue.length > 0;
   while (running < MAX_PARALLEL && queue.length) {
     const job = queue.shift();
     running++;
-    jobs.set(job.key, "running");
+    jobs.get(job.key).state = "running";
     job
-      .fn()
+      .fn(job.key)
       .then((msg) => results.push({ ok: true, msg }))
       .catch((e) => results.push({ ok: false, msg: `${job.label}: ${e}` }))
       .finally(async () => {
@@ -138,6 +142,7 @@ function pump() {
         progress();
       });
   }
+  if (started) render(); // "Queued" rows and buttons become running ones
   progress();
 }
 
@@ -157,12 +162,63 @@ function progress() {
   results = [];
 }
 
-/** Button for a queueable action: shows Queued…/Installing… while its job is pending. */
+/** Button for a queueable action: shows Queued…/Downloading…/Installing… while its job is pending. */
 function jobButton(key, attrs, label, cls = "") {
-  const st = jobs.get(key);
-  if (st) return `<button class="small ${cls}" disabled>${st === "running" ? "Installing…" : "Queued…"}</button>`;
+  const j = jobs.get(key);
+  if (j) return `<button class="small ${cls}" disabled>${j.state === "running" ? (BUTTON_PHASE[j.phase] ?? "Working") : "Queued"}…</button>`;
   return `<button class="small ${cls}" ${attrs}>${label}</button>`;
 }
+
+const PHASE = {
+  checking: "Finding the newest version",
+  downloading: "Downloading",
+  unpacking: "Unpacking",
+  comparing: "Comparing with what's installed",
+  installing: "Installing",
+};
+const BUTTON_PHASE = { checking: "Checking", downloading: "Downloading", unpacking: "Unpacking", installing: "Installing" };
+const mb = (n) => (n / 1048576).toFixed(n < 10 * 1048576 ? 1 : 0);
+
+/** "Downloading 1.2.3 · 2.4 of 6.0 MB" */
+function jobText(j) {
+  let t = PHASE[j.phase] ?? "Working";
+  if (j.version && j.phase !== "checking") t += ` ${shortVersion(j.version)}`;
+  if (j.phase === "downloading") t += j.total ? ` · ${mb(j.done)} of ${mb(j.total)} MB` : ` · ${mb(j.done)} MB`;
+  return t;
+}
+
+/** The "In progress" card: every queued or running install, with a progress bar. */
+function renderJobs() {
+  const list = [...jobs.values()];
+  $("jobs-card").hidden = !list.length;
+  $("jobs").innerHTML = list
+    .map((j) => {
+      const queued = j.state === "queued";
+      const pct = !queued && j.phase === "downloading" && j.total ? Math.min(100, Math.round((100 * j.done) / j.total)) : null;
+      // No value = an animated "busy" bar for steps without a known size.
+      const bar = queued ? `<progress max="100" value="0"></progress>`
+        : pct == null ? `<progress></progress>` : `<progress max="100" value="${pct}"></progress>`;
+      return `<tr>
+        <td><strong>${esc(j.label)}</strong></td>
+        <td class="muted">${esc(queued ? "Queued, waiting for a free slot" : jobText(j))}</td>
+        <td class="meter-cell">${bar}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+window.__TAURI__.event.listen("job-progress", ({ payload: p }) => {
+  if (rv?.loading && p.job === rv.progressJob) {
+    $("rv-summary").textContent = jobText(p) + "…";
+    return;
+  }
+  const j = jobs.get(p.job);
+  if (!j) return;
+  const phaseChanged = j.phase !== p.phase;
+  Object.assign(j, p, { version: p.version ?? j.version });
+  // Byte counts only touch the card; a new phase also relabels the row's button.
+  phaseChanged ? render() : renderJobs();
+});
 
 // Opens in the user's own browser via the backend (allow-listed sites only).
 const extLink = (url, text) => `<a href="#" class="ext" data-open="${esc(url)}">${esc(text)}</a>`;
@@ -298,6 +354,7 @@ function render() {
   $("btn-update-all").textContent = pending ? `Update all (${pending})` : "Update all";
   $("btn-check").textContent = checking ? "Checking…" : "Check for updates";
   $("btn-install").disabled = jobs.has("url:" + $("in-url").value.trim());
+  renderJobs();
 }
 
 async function refresh() {
@@ -383,8 +440,8 @@ $("btn-install").onclick = () => {
   // Clear right away so the next URL can be pasted while this one installs.
   $("in-url").value = "";
   $("in-pattern").value = "";
-  enqueue("url:" + url, url, async () => {
-    const a = await invoke("install", { url, assetPattern });
+  enqueue("url:" + url, url, async (job) => {
+    const a = await invoke("install", { url, assetPattern, job });
     delete updates[a.id];
     return `${a.name} ${a.version}`;
   });
@@ -442,8 +499,8 @@ setInterval(autoCheck, RECHECK_MS);
 function enqueueUpdate(id) {
   const before = state.addons.find((a) => a.id === id);
   const name = before?.name ?? id;
-  enqueue("up:" + id, name, async () => {
-    const a = await invoke("update_addon", { id });
+  enqueue("up:" + id, name, async (job) => {
+    const a = await invoke("update_addon", { id, job });
     delete updates[id];
     delete notes[id];
     if (notesOpen === id) notesOpen = null;
@@ -480,8 +537,10 @@ let rv = null; // { token, name, from_version, to_version, review, jobKey }
 const RV_LETTER = { added: "A", removed: "D", modified: "M" };
 const RV_LABEL = { danger: "Blocked", warn: "Check", info: "Note" };
 
+let reviewSeq = 0;
+/** load(job) starts the backend call; `job` lets it report download progress into the dialog. */
 function openReview(title, jobKey, load) {
-  const mine = { loading: true, jobKey };
+  const mine = { loading: true, jobKey, progressJob: `review:${++reviewSeq}` };
   if (rv?.token) invoke("discard_review", { token: rv.token }).catch(() => {});
   rv = mine;
   $("review").hidden = false;
@@ -493,7 +552,7 @@ function openReview(title, jobKey, load) {
   $("rv-install").disabled = true;
   $("rv-install").textContent = "Install";
   $("rv-note").textContent = "";
-  load
+  load(mine.progressJob)
     .then((r) => {
       if (rv !== mine) return invoke("discard_review", { token: r.token }); // closed or replaced meanwhile
       rv = { ...r, jobKey };
@@ -588,8 +647,8 @@ $("rv-install").onclick = () => {
     `${r.name} contains files that can run on Windows:\n\n${r.review.findings.filter((f) => f.severity === "danger").map((f) => f.path).join("\n")}\n\n` +
       "WoW never runs these and addons don't need them. Install anyway?")) return;
   closeReview(false);
-  enqueue(r.jobKey, r.name, async () => {
-    const a = await invoke("apply_review", { token: r.token, allowPrograms: danger });
+  enqueue(r.jobKey, r.name, async (job) => {
+    const a = await invoke("apply_review", { token: r.token, allowPrograms: danger, job });
     delete updates[a.id];
     delete notes[a.id];
     return `${a.name} ${a.version} (reviewed)`;
@@ -611,8 +670,8 @@ $("btn-import").onclick = () =>
     if (online.length && !confirm(`Install ${online.length} addon${online.length === 1 ? "" : "s"} from hearth-addons.json?\n\n${online.map((e) => e.name).join("\n")}`))
       return status("Import cancelled.");
     for (const e of online) {
-      enqueue("url:" + e.provider + ":" + e.source, e.name, async () => {
-        const a = await invoke("install", { url: sourceUrl(e.provider, e.source), assetPattern: e.asset_pattern ?? null });
+      enqueue("url:" + e.provider + ":" + e.source, e.name, async (job) => {
+        const a = await invoke("install", { url: sourceUrl(e.provider, e.source), assetPattern: e.asset_pattern ?? null, job });
         if (e.pinned) await invoke("set_pinned", { id: a.id, pinned: true });
         return `${a.name} ${a.version}${e.pinned ? " (pinned)" : ""}`;
       });
@@ -643,13 +702,13 @@ $("downloads").onclick = (e) => {
   const di = e.target.closest("[data-diff-local]")?.dataset.diffLocal;
   if (di !== undefined) {
     const r = actionableRows[Number(di)];
-    return openReview(`${r.main.title}: ${r.file_name}`, "dl:" + r.path, invoke("review_local", { path: r.path }));
+    return openReview(`${r.main.title}: ${r.file_name}`, "dl:" + r.path, (job) => invoke("review_local", { path: r.path, job }));
   }
   const ri = e.target.closest("[data-remote]")?.dataset.remote;
   if (ri !== undefined) {
     const r = actionableRows[Number(ri)];
-    return enqueue("rm:" + r.link_provider + ":" + r.link_source, r.main.title, async () => {
-      const a = await invoke("install", { url: sourceUrl(r.link_provider, r.link_source), assetPattern: null });
+    return enqueue("rm:" + r.link_provider + ":" + r.link_source, r.main.title, async (job) => {
+      const a = await invoke("install", { url: sourceUrl(r.link_provider, r.link_source), assetPattern: null, job });
       delete updates[a.id];
       return `${a.name} ${a.version} (from ${sourceLabel(a.provider, a.source)})`;
     });
@@ -657,8 +716,8 @@ $("downloads").onclick = (e) => {
   const i = e.target.closest("[data-local]")?.dataset.local;
   if (i === undefined) return;
   const r = actionableRows[Number(i)];
-  enqueue("dl:" + r.path, r.main.title, async () => {
-    const a = await invoke("install_local", { path: r.path });
+  enqueue("dl:" + r.path, r.main.title, async (job) => {
+    const a = await invoke("install_local", { path: r.path, job });
     delete updates[a.id];
     return `${a.name} ${a.version}${a.provider === "local" ? " (manual)" : ` (updates from ${sourceLabel(a.provider, a.source)})`}`;
   });
@@ -708,8 +767,8 @@ $("tracked").onclick = (e) => {
     if (!source) return status("Paste a CurseForge project ID, GitHub URL or WoWInterface URL.", true);
     const name = state.addons.find((a) => a.id === go)?.name ?? go;
     linkOpen = null;
-    return enqueue("ln:" + go, name, async () => {
-      const a = await invoke("link_addon", { id: go, source });
+    return enqueue("ln:" + go, name, async (job) => {
+      const a = await invoke("link_addon", { id: go, source, job });
       delete updates[go];
       return `${a.name} ${a.version} (now updates from ${sourceLabel(a.provider, a.source)})`;
     });
@@ -718,13 +777,13 @@ $("tracked").onclick = (e) => {
   const df = e.target.closest("[data-diff]")?.dataset.diff;
   if (df) {
     const a = state.addons.find((x) => x.id === df);
-    openReview(`${a?.name ?? df}: checking the update…`, "up:" + df, invoke("review_update", { id: df }));
+    openReview(`${a?.name ?? df}: checking the update…`, "up:" + df, (job) => invoke("review_update", { id: df, job }));
   }
   const depZip = e.target.closest("[data-dep-zip]");
   if (depZip) {
     const path = depZip.dataset.depZip;
-    enqueue("dl:" + path, depZip.dataset.depName, async () => {
-      const a = await invoke("install_local", { path });
+    enqueue("dl:" + path, depZip.dataset.depName, async (job) => {
+      const a = await invoke("install_local", { path, job });
       return `${a.name} ${a.version} (dependency)`;
     });
   }
