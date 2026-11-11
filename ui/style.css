@@ -39,7 +39,8 @@ h1 .build.dirty { color: var(--accent); }
 h2 { margin: 0 0 10px; font-size: 15px; }
 .actions, .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .row input { flex: 1; min-width: 200px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+/* overflow-x: anything still too wide scrolls inside its card instead of spilling out of it. */
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; overflow-x: auto; }
 label { display: block; margin: 8px 0; }
 label input { display: block; width: 100%; margin-top: 4px; }
 input {
@@ -60,8 +61,12 @@ button:disabled { opacity: .5; cursor: default; }
 table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
 th, td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+/* Long versions, zip names and URLs have no spaces: let them wrap instead of widening the table. */
+td { overflow-wrap: anywhere; }
 tr:last-child td { border-bottom: none; }
-td.actions-cell { text-align: right; white-space: nowrap; }
+/* Buttons wrap onto a second line when the window is narrow; each button stays whole. */
+td.actions-cell { text-align: right; overflow-wrap: normal; }
+td.actions-cell button { white-space: nowrap; margin: 1px 0; }
 #jobs td { vertical-align: middle; }
 td.meter-cell { width: 34%; }
 /* Progress bar. The fill moves by transform, which the compositor animates without repainting;
