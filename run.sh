@@ -13,4 +13,8 @@ if [ -e /dev/dxg ]; then
 else
   export WEBKIT_DISABLE_DMABUF_RENDERER=1
 fi
+# Under WSLg, run on X11 so WSLg draws the window frame (GTK's own Wayland frame is hard to resize).
+if [ -d /mnt/wslg ]; then
+  export GDK_BACKEND=x11
+fi
 exec cargo run "$@"

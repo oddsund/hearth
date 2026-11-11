@@ -22,6 +22,11 @@ if [ -e /dev/dxg ]; then
 else
   export WEBKIT_DISABLE_DMABUF_RENDERER=1
 fi
+# Under WSLg, run on X11 so WSLg draws the window frame: on Wayland, GTK's own frame has
+# resize edges that are hard to grab.
+if [ -d /mnt/wslg ]; then
+  export GDK_BACKEND=x11
+fi
 exec /usr/local/lib/hearth/hearth "$@"
 EOF
 chmod 755 /usr/local/bin/hearth
