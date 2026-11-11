@@ -470,6 +470,10 @@ async function checkUpdates(quiet = false) {
   updates = Object.fromEntries(list.map((u) => [u.id, u]));
   const n = list.filter((u) => u.has_update).length;
   const errs = list.filter((u) => u.error);
+  lastCheck = Date.now();
+  // Every online lookup failed: most likely no network yet. (One broken source isn't a reason to retry.)
+  const online = list.filter((u) => !u.manual).length;
+  lastCheckFailed = online > 0 && errs.length >= online;
   render();
   if (quiet && (running || queue.length)) return;
   if (quiet && !n && !errs.length) return status("Ready. Everything is up to date.");
@@ -500,13 +504,37 @@ setInterval(watchDownloads, 3000);
 window.addEventListener("focus", watchDownloads);
 
 const RECHECK_MS = 6 * 60 * 60 * 1000;
+// Started at Windows login, Hearth often runs before WSL's network is up, and every lookup
+// fails. Retry failed checks after 1, 2, 4… minutes (up to 30), and re-check when the window
+// is shown if the last check failed or is over an hour old.
+const STALE_MS = 60 * 60 * 1000;
+let lastCheck = 0;
+let lastCheckFailed = false;
+let retryMs = 60_000;
+let retryTimer = null;
 async function autoCheck() {
-  if (busy || !state.addons.some((a) => a.provider !== "local")) return;
+  if (!state.addons.some((a) => a.provider !== "local")) return;
+  if (busy) return scheduleRetry(); // a one-off action is running: come back shortly
+  clearTimeout(retryTimer);
+  retryTimer = null;
   busy = true;
   render();
-  try { await checkUpdates(true); } catch (_) {} finally { busy = false; render(); }
+  try { await checkUpdates(true); } catch (_) { lastCheck = Date.now(); lastCheckFailed = true; } finally { busy = false; render(); }
+  if (lastCheckFailed) scheduleRetry();
+  else retryMs = 60_000;
+}
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => { retryTimer = null; autoCheck(); }, retryMs);
+  retryMs = Math.min(retryMs * 2, 30 * 60_000);
 }
 setInterval(autoCheck, RECHECK_MS);
+function checkIfStale() {
+  if (document.hidden || checking) return;
+  if (lastCheckFailed || Date.now() - lastCheck > STALE_MS) autoCheck();
+}
+document.addEventListener("visibilitychange", checkIfStale);
+window.addEventListener("focus", checkIfStale);
 
 function enqueueUpdate(id) {
   const before = state.addons.find((a) => a.id === id);
@@ -835,8 +863,10 @@ $("tracked").onclick = (e) => {
     } catch (_) {}
     await refresh();
     if (state.addons_dir) status("Ready. AddOns: " + state.addons_dir);
-    await autoCheck();
   } catch (e) {
     status(String(e), true);
+    // Right after login the Windows drives may not be ready yet; the retries below catch up.
+    try { state = await invoke("get_state"); render(); } catch (_) {}
   }
+  await autoCheck();
 })();
