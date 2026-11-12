@@ -136,7 +136,7 @@ summary { cursor: pointer; color: var(--muted); }
   white-space: pre-wrap;
   user-select: text;
   word-break: break-all;
-  /* Own compositing layer: otherwise WebKitGTK repaints the whole page on every scroll step. */
+  /* Own compositing layer, so scrolling under the fixed bar never repaints it. */
   will-change: transform;
 }
 #status.error { color: var(--bad); }

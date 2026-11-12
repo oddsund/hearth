@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="src-tauri/icons/icon.png" width="96" alt="">
+<img src="backend/icons/icon.png" width="96" alt="">
 
 # Hearth
 
@@ -8,7 +8,7 @@
 
 It installs and updates your addons, keeps backups, and shows you what an update changes before it lands.
 
-![Rust](https://img.shields.io/badge/Rust-Tauri_2-dea584?logo=rust&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-axum-dea584?logo=rust&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-plain_HTML%2FJS-f0a030)
 ![Version](https://img.shields.io/badge/version-1.0.0-2f8f4e)
 ![License](https://img.shields.io/badge/license-MIT-6b7385)
@@ -56,7 +56,7 @@ There's no search and no catalogue. You bring the addon, and Hearth keeps it up 
 
 ### Everything else
 - **Export / import** your addon list as `hearth-addons.json` to move to another PC or share a setup.
-- **Starts with Windows,** hidden in the background. Launching it again brings the window up.
+- **A real Windows window** without installing anything on Windows: the engine runs in WSL2 and Edge shows the window (see below).
 - **Build identifier** in the header (`v1.0.0 · bc73de9`), so you always know which build you're running.
 - **Light and dark** follow your system theme.
 
@@ -68,16 +68,16 @@ Hearth reads your game's version from `.build.info` / `.flavor.info` and uses it
 
 ### On Windows, through WSL2
 
-Windows' Smart App Control blocks unsigned executables you build yourself. Hearth sidesteps that by building and running inside WSL2, and WSLg shows the window like any other app. It's developed on **Fedora**, but any distro with WebKitGTK works.
+Windows' Smart App Control blocks unsigned executables you build yourself. Hearth sidesteps that: its engine is built and run inside WSL2, and its window is **Microsoft Edge in app mode**, a plain window with no browser toolbar. Edge is signed by Microsoft, so it's allowed to run, and it draws with your GPU, resizes and scales like any Windows app. It's developed on **Fedora**, but any distro works.
 
 **1. One-time setup** (in the distro, as the user that will run Hearth):
 
 ```bash
-sudo dnf install webkit2gtk4.1-devel openssl-devel libappindicator-gtk3-devel librsvg2-devel libxdo-devel gcc gcc-c++
+sudo dnf install gcc
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-On Ubuntu/Debian the packages are `libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential`.
+On Ubuntu/Debian, install `build-essential` instead of `gcc`.
 
 **2. Build and install.** Re-run this after pulling changes:
 
@@ -85,7 +85,7 @@ On Ubuntu/Debian the packages are `libwebkit2gtk-4.1-dev libssl-dev libayatana-a
 wsl -d <distro> -u root -- bash /mnt/c/path/to/hearth/install.sh
 ```
 
-This puts the binary in `/usr/local/lib/hearth/`, adds a `hearth` launcher, and creates a `.desktop` entry, which WSLg turns into a Start menu item.
+This installs `/usr/local/bin/hearth` and a `.desktop` entry, which WSLg turns into a Start menu item.
 
 **3. Start it** from the Start menu, or from a shortcut that runs:
 
@@ -93,23 +93,27 @@ This puts the binary in `/usr/local/lib/hearth/`, adds a `hearth` launcher, and 
 wslg.exe -d <distro> -u root -- /usr/local/bin/hearth
 ```
 
-Put a copy of that shortcut in `shell:startup` with `--hidden` added, and Hearth runs in the background from login.
+Starting it again while it runs opens another window. Hearth exits by itself about a minute after its last window closes, and checks for updates whenever a window opens.
+
+**How the window talks to the engine:** Hearth serves its page on `127.0.0.1:47820` (set `HEARTH_PORT` to change it). Other programs on the PC can reach that port too, so a window only gets in through a one-time link Hearth opens itself, which it swaps for a cookie that's new every time Hearth starts. Requests from other websites are refused. Edge runs with a profile of its own in `%LOCALAPPDATA%\Hearth\Edge`, so your extensions don't run in Hearth's window. To use another browser, set `HEARTH_BROWSER` to a program to run with the link, or to `none` to just print the link.
 
 > [!TIP]
-> If links won't open in your Windows browser ("Exec format error"), systemd in your distro has removed WSL's interop handler. Restore it with
+> If no window opens ("Exec format error"), systemd in your distro has removed WSL's interop handler, which Hearth needs to start Edge and to open links. Restore it with
 > `echo ':WSLInterop:M::MZ::/init:PF' | sudo tee /etc/binfmt.d/WSLInterop.conf` and restart WSL.
 
 ### On Linux
 
-Install the same dependencies, then use `./run.sh` (add `--release` for an optimized build) or `install.sh`.
+Install Rust and a C compiler, then use `./run.sh` (add `--release` for an optimized build) or `install.sh`. The window opens in your default browser.
 
 ## Development
 
 ```
 hearth/
 ├─ ui/                 plain HTML/CSS/JS: no Node, no bundler
-└─ src-tauri/src/
-   ├─ main.rs          Tauri commands and app state
+└─ backend/src/
+   ├─ main.rs          commands the UI calls, and app state
+   ├─ server.rs        local web server: UI, API, live progress, access checks
+   ├─ browser.rs       opens the window (Edge app mode under WSL)
    ├─ providers.rs     GitHub, WoWInterface and CurseForge lookups
    ├─ installer.rs     download → unzip → stage → swap, backups, roll back
    ├─ review.rs        diffs and static checks for updates
@@ -122,7 +126,7 @@ hearth/
 ```
 
 ```bash
-cd src-tauri
+cd backend
 cargo test                # offline tests
 cargo test -- --ignored   # also hits GitHub, WoWInterface and CurseForge, and reads your Downloads
 ```

@@ -1,4 +1,28 @@
-const { invoke } = window.__TAURI__.core;
+// The backend is a small web server on 127.0.0.1 (see backend/src/server.rs). Each call is a
+// same-origin JSON POST; errors come back as their message text.
+async function invoke(cmd, args = {}) {
+  let r;
+  try {
+    r = await fetch("/api/" + cmd, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(args),
+    });
+  } catch (_) {
+    throw "Lost contact with Hearth. Close this window and open Hearth again.";
+  }
+  const body = await r.json().catch(() => null);
+  if (!r.ok) throw body ?? `Hearth answered ${r.status}`;
+  return body;
+}
+
+// Live events from the backend (install progress). EventSource reconnects by itself.
+const listeners = {};
+const on = (event, fn) => (listeners[event] = fn);
+new EventSource("/api/events").onmessage = (m) => {
+  const { event, payload } = JSON.parse(m.data);
+  listeners[event]?.(payload);
+};
 const $ = (id) => document.getElementById(id);
 
 let state = { addons: [], addons_dir: "" };
@@ -219,7 +243,7 @@ function renderJobs() {
   }
 }
 
-window.__TAURI__.event.listen("job-progress", ({ payload: p }) => {
+on("job-progress", (p) => {
   if (rv?.loading && p.job === rv.progressJob) {
     $("rv-summary").textContent = jobText(p) + "…";
     return;

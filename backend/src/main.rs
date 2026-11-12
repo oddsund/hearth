@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod browser;
 mod downloads;
 mod game;
 mod installer;
 mod providers;
 mod state;
 mod review;
+mod server;
 mod toc;
 mod trash;
 mod wtf;
@@ -23,6 +25,7 @@ use anyhow::Context;
 use serde::Serialize;
 use state::{AppState, TrackedAddon};
 use std::cmp::Ordering;
+use server::Events;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
@@ -47,7 +50,7 @@ type Res<T> = Result<T, String>;
 
 /// Tells the UI how far one install has come ("job-progress" events), keyed by the UI's job id.
 /// Without a job id (older callers) it stays silent.
-struct Progress(Option<(tauri::AppHandle, String)>);
+struct Progress(Option<(Events, String)>);
 
 #[derive(Serialize, Clone)]
 struct ProgressEvent<'a> {
@@ -60,8 +63,8 @@ struct ProgressEvent<'a> {
 }
 
 impl Progress {
-    fn new(app: tauri::AppHandle, job: Option<String>) -> Self {
-        Progress(job.map(|j| (app, j)))
+    fn new(ev: &Events, job: Option<String>) -> Self {
+        Progress(job.map(|j| (ev.clone(), j)))
     }
 
     fn phase(&self, phase: &str) {
@@ -69,9 +72,8 @@ impl Progress {
     }
 
     fn send(&self, phase: &str, version: Option<&str>, done: u64, total: Option<u64>) {
-        use tauri::Emitter;
-        if let Some((app, job)) = &self.0 {
-            let _ = app.emit("job-progress", ProgressEvent { job, phase, version, done, total });
+        if let Some((ev, job)) = &self.0 {
+            server::emit(ev, "job-progress", ProgressEvent { job, phase, version, done, total });
         }
     }
 
@@ -333,7 +335,7 @@ async fn apply_stage(
 /// Run disk work (unzipping, moving folders, zipping WTF) on a blocking thread, so a slow disk
 /// never stalls the async threads that serve the UI and run the other downloads.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
-    tauri::async_runtime::spawn_blocking(f)
+    tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| anyhow::anyhow!("Background task failed: {e}"))
 }
@@ -453,14 +455,12 @@ fn origin_for(st: &AppState, info: &toc::TocInfo) -> Origin {
     Origin { provider: "local".into(), source: info.folder.clone(), url: String::new(), asset_pattern: None, curse_id }
 }
 
-#[tauri::command]
-async fn get_state(ctx: tauri::State<'_, Ctx>) -> Res<AppState> {
+async fn get_state(ctx: &Ctx) -> Res<AppState> {
     Ok(ctx.state.lock().await.clone())
 }
 
-#[tauri::command]
 async fn save_settings(
-    ctx: tauri::State<'_, Ctx>,
+    ctx: &Ctx,
     addons_dir: String,
     downloads_dir: String,
     game_interface: String,
@@ -475,8 +475,7 @@ async fn save_settings(
     Ok(st.clone())
 }
 
-#[tauri::command]
-async fn scan(ctx: tauri::State<'_, Ctx>) -> Res<Vec<ScanRow>> {
+async fn scan(ctx: &Ctx) -> Res<Vec<ScanRow>> {
     let st = ctx.state.lock().await.clone();
     blocking(move || {
         toc::scan(Path::new(&st.addons_dir))
@@ -491,15 +490,14 @@ async fn scan(ctx: tauri::State<'_, Ctx>) -> Res<Vec<ScanRow>> {
     .map_err(err)
 }
 
-#[tauri::command]
-async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
+async fn scan_downloads(ctx: &Ctx) -> Res<Vec<DownloadRow>> {
     let st = ctx.state.lock().await.clone();
     if st.downloads_dir.is_empty() {
         return Ok(vec![]);
     }
     let addons_dir = PathBuf::from(&st.addons_dir);
     let dl_dir = PathBuf::from(&st.downloads_dir);
-    let rows = tauri::async_runtime::spawn_blocking(move || {
+    let rows = tokio::task::spawn_blocking(move || {
         downloads::scan(&dl_dir)
             .into_iter()
             .map(|c| {
@@ -542,10 +540,9 @@ async fn scan_downloads(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DownloadRow>> {
     Ok(rows)
 }
 
-#[tauri::command]
-async fn missing_dependencies(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DepReport>> {
+async fn missing_dependencies(ctx: &Ctx) -> Res<Vec<DepReport>> {
     let st = ctx.state.lock().await.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let zips = if st.downloads_dir.is_empty() { vec![] } else { downloads::scan(Path::new(&st.downloads_dir)) };
         missing_deps(&st, &zips)
     })
@@ -553,15 +550,13 @@ async fn missing_dependencies(ctx: tauri::State<'_, Ctx>) -> Res<Vec<DepReport>>
     .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn adoptable_addons(ctx: tauri::State<'_, Ctx>) -> Res<Vec<AdoptGroup>> {
+async fn adoptable_addons(ctx: &Ctx) -> Res<Vec<AdoptGroup>> {
     let st = ctx.state.lock().await.clone();
     blocking(move || adoptable(&st)).await.map_err(err)
 }
 
 /// Start tracking folders that are already installed. Nothing is downloaded or moved.
-#[tauri::command]
-async fn adopt(ctx: tauri::State<'_, Ctx>, folders: Vec<String>) -> Res<TrackedAddon> {
+async fn adopt(ctx: &Ctx, folders: Vec<String>) -> Res<TrackedAddon> {
     if let Some(f) = folders.iter().find(|f| !installer::is_folder_name(f)) {
         return Err(format!("{f:?} isn't an addon folder name"));
     }
@@ -577,8 +572,7 @@ async fn adopt(ctx: tauri::State<'_, Ctx>, folders: Vec<String>) -> Res<TrackedA
 }
 
 /// Move zips from the Downloads folder to the Recycle Bin. Only .zip files directly in Downloads.
-#[tauri::command]
-async fn recycle_zips(ctx: tauri::State<'_, Ctx>, paths: Vec<String>) -> Res<usize> {
+async fn recycle_zips(ctx: &Ctx, paths: Vec<String>) -> Res<usize> {
     let dl = PathBuf::from(&ctx.state.lock().await.downloads_dir);
     let mut ok: Vec<PathBuf> = Vec::new();
     for p in paths.iter().map(PathBuf::from) {
@@ -590,7 +584,7 @@ async fn recycle_zips(ctx: tauri::State<'_, Ctx>, paths: Vec<String>) -> Res<usi
         ok.push(p);
     }
     let n = ok.len();
-    tauri::async_runtime::spawn_blocking(move || trash::recycle(&ok.iter().map(|p| p.as_path()).collect::<Vec<_>>()))
+    tokio::task::spawn_blocking(move || trash::recycle(&ok.iter().map(|p| p.as_path()).collect::<Vec<_>>()))
         .await
         .map_err(|e| e.to_string())?
         .map_err(err)?;
@@ -598,21 +592,19 @@ async fn recycle_zips(ctx: tauri::State<'_, Ctx>, paths: Vec<String>) -> Res<usi
 }
 
 /// Changes whenever a zip is added, removed or replaced in Downloads (as a string: u64 > JS number).
-#[tauri::command]
-async fn downloads_signature(ctx: tauri::State<'_, Ctx>) -> Res<String> {
+async fn downloads_signature(ctx: &Ctx) -> Res<String> {
     let dir = PathBuf::from(&ctx.state.lock().await.downloads_dir);
-    tauri::async_runtime::spawn_blocking(move || downloads::signature(&dir).to_string())
+    tokio::task::spawn_blocking(move || downloads::signature(&dir).to_string())
         .await
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn install_local(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, path: String, job: Option<String>) -> Res<TrackedAddon> {
-    let p = Progress::new(app, job);
+async fn install_local(ev: &Events, ctx: &Ctx, path: String, job: Option<String>) -> Res<TrackedAddon> {
+    let p = Progress::new(ev, job);
     let (info, stage) = stage_local(path, true, &p).await?;
     let o = origin_for(&*ctx.state.lock().await, &info);
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
-    apply_stage(ctx.inner(), o, version, stage, &[], None, &p).await.map_err(err)
+    apply_stage(ctx, o, version, stage, &[], None, &p).await.map_err(err)
 }
 
 // ---- Show diff: unpack an update, compare it with what's installed, then install or cancel.
@@ -647,7 +639,7 @@ async fn start_review(
         (PathBuf::from(&st.addons_dir), old)
     };
     // Reading and diffing every file can take a moment for big addons: off the async threads.
-    let (stage, old, rv) = tauri::async_runtime::spawn_blocking(move || {
+    let (stage, old, rv) = tokio::task::spawn_blocking(move || {
         let rv = review::review(&addons_dir, &stage, &old);
         (stage, old, rv)
     })
@@ -673,24 +665,22 @@ async fn start_review(
 }
 
 /// Download a tracked addon's update and review it without installing.
-#[tauri::command]
-async fn review_update(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, id: String, job: Option<String>) -> Res<ReviewOut> {
-    let p = Progress::new(app, job);
+async fn review_update(ev: &Events, ctx: &Ctx, id: String, job: Option<String>) -> Res<ReviewOut> {
+    let p = Progress::new(ev, job);
     let a = {
         let st = ctx.state.lock().await;
         st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
     };
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    let Fetched { o, version, bytes, replaced_id } = fetch(ctx.inner(), o, &p).await.map_err(err)?;
+    let Fetched { o, version, bytes, replaced_id } = fetch(ctx, o, &p).await.map_err(err)?;
     let stage = stage_bytes(bytes, false, &p).await.map_err(err)?;
     p.phase("comparing");
-    start_review(ctx.inner(), a.name, Some(a.version), o, version, stage, replaced_id).await
+    start_review(ctx, a.name, Some(a.version), o, version, stage, replaced_id).await
 }
 
 /// Review a zip from Downloads against what's installed.
-#[tauri::command]
-async fn review_local(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, path: String, job: Option<String>) -> Res<ReviewOut> {
-    let p = Progress::new(app, job);
+async fn review_local(ev: &Events, ctx: &Ctx, path: String, job: Option<String>) -> Res<ReviewOut> {
+    let p = Progress::new(ev, job);
     let (info, stage) = stage_local(path, false, &p).await?;
     p.phase("comparing");
     let (o, from) = {
@@ -699,12 +689,11 @@ async fn review_local(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, path: S
         (origin_for(&st, &info), from)
     };
     let version = info.version.clone().unwrap_or_else(|| "unknown".into());
-    start_review(ctx.inner(), info.title.clone(), from, o, version, stage, None).await
+    start_review(ctx, info.title.clone(), from, o, version, stage, None).await
 }
 
 /// Unified diff of one file in a pending review.
-#[tauri::command]
-async fn review_file(ctx: tauri::State<'_, Ctx>, token: String, path: String) -> Res<String> {
+async fn review_file(ctx: &Ctx, token: String, path: String) -> Res<String> {
     let addons_dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
     let pending = ctx.reviews.lock().unwrap_or_else(|e| e.into_inner());
     let p = pending.get(&token).ok_or("This review has expired. Open Show diff again.")?;
@@ -712,10 +701,9 @@ async fn review_file(ctx: tauri::State<'_, Ctx>, token: String, path: String) ->
 }
 
 /// Install a reviewed update. `allow_programs` = the user saw the program-file warning and said yes.
-#[tauri::command]
 async fn apply_review(
-    app: tauri::AppHandle,
-    ctx: tauri::State<'_, Ctx>,
+    ev: &Events,
+    ctx: &Ctx,
     token: String,
     allow_programs: bool,
     job: Option<String>,
@@ -729,19 +717,17 @@ async fn apply_review(
         }
         p
     };
-    let progress = Progress::new(app, job);
-    apply_stage(ctx.inner(), p.origin, p.version, p.stage, &[], p.replaced_id, &progress).await.map_err(err)
+    let progress = Progress::new(ev, job);
+    apply_stage(ctx, p.origin, p.version, p.stage, &[], p.replaced_id, &progress).await.map_err(err)
 }
 
-#[tauri::command]
-fn discard_review(ctx: tauri::State<'_, Ctx>, token: String) {
+fn discard_review(ctx: &Ctx, token: String) {
     ctx.reviews.lock().unwrap_or_else(|e| e.into_inner()).remove(&token);
 }
 
-#[tauri::command]
 async fn install(
-    app: tauri::AppHandle,
-    ctx: tauri::State<'_, Ctx>,
+    ev: &Events,
+    ctx: &Ctx,
     url: String,
     asset_pattern: Option<String>,
     job: Option<String>,
@@ -754,14 +740,13 @@ async fn install(
         asset_pattern: asset_pattern.filter(|s| !s.trim().is_empty()),
         curse_id: None,
     };
-    do_install(ctx.inner(), o, &[], &Progress::new(app, job)).await.map_err(err)
+    do_install(ctx, o, &[], &Progress::new(ev, job)).await.map_err(err)
 }
 
 /// Connect an addon (usually a manual one) to an online source and install the latest from there.
-#[tauri::command]
 async fn link_addon(
-    app: tauri::AppHandle,
-    ctx: tauri::State<'_, Ctx>,
+    ev: &Events,
+    ctx: &Ctx,
     id: String,
     source: String,
     job: Option<String>,
@@ -773,7 +758,7 @@ async fn link_addon(
     };
     let curse_id = if p.provider == "curse" { Some(p.source.clone()) } else { old.curse_id.clone() };
     let o = Origin { provider: p.provider.into(), source: p.source, url: p.url, asset_pattern: None, curse_id };
-    let new = do_install(ctx.inner(), o, &old.folders, &Progress::new(app, job)).await.map_err(err)?;
+    let new = do_install(ctx, o, &old.folders, &Progress::new(ev, job)).await.map_err(err)?;
     if new.id != old.id {
         // Its folders were backed up/replaced by the install above.
         let mut st = ctx.state.lock().await;
@@ -783,8 +768,7 @@ async fn link_addon(
     Ok(new)
 }
 
-#[tauri::command]
-async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
+async fn check_updates(ctx: &Ctx) -> Res<Vec<UpdateInfo>> {
     use std::sync::Arc;
     /// Lookups in flight at once: quick with many addons, still gentle on GitHub and CurseForge.
     const PARALLEL: usize = 6;
@@ -797,7 +781,7 @@ async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
         .into_iter()
         .map(|a| {
             let (client, game, token, gate) = (ctx.client.clone(), game.clone(), token.clone(), gate.clone());
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 let base = UpdateInfo {
                     id: a.id.clone(),
                     current: a.version.clone(),
@@ -830,19 +814,17 @@ async fn check_updates(ctx: tauri::State<'_, Ctx>) -> Res<Vec<UpdateInfo>> {
     Ok(out)
 }
 
-#[tauri::command]
-async fn update_addon(app: tauri::AppHandle, ctx: tauri::State<'_, Ctx>, id: String, job: Option<String>) -> Res<TrackedAddon> {
+async fn update_addon(ev: &Events, ctx: &Ctx, id: String, job: Option<String>) -> Res<TrackedAddon> {
     let a = {
         let st = ctx.state.lock().await;
         st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?
     };
     let o = Origin { provider: a.provider, source: a.source, url: a.url, asset_pattern: a.asset_pattern, curse_id: a.curse_id };
-    do_install(ctx.inner(), o, &[], &Progress::new(app, job)).await.map_err(err)
+    do_install(ctx, o, &[], &Progress::new(ev, job)).await.map_err(err)
 }
 
 /// Moves the addon's folders to the backup area (not a hard delete) and stops tracking it.
-#[tauri::command]
-async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
+async fn uninstall(ctx: &Ctx, id: String) -> Res<()> {
     let mut st = ctx.state.lock().await;
     let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
     let addons_dir = PathBuf::from(&st.addons_dir);
@@ -858,32 +840,28 @@ async fn uninstall(ctx: tauri::State<'_, Ctx>, id: String) -> Res<()> {
     Ok(())
 }
 
-#[tauri::command]
-async fn settings_backups(ctx: tauri::State<'_, Ctx>) -> Res<Vec<wtf::Snapshot>> {
+async fn settings_backups(ctx: &Ctx) -> Res<Vec<wtf::Snapshot>> {
     let dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
     Ok(wtf::list(&dir))
 }
 
-#[tauri::command]
-async fn backup_settings_now(ctx: tauri::State<'_, Ctx>) -> Res<Option<wtf::Snapshot>> {
+async fn backup_settings_now(ctx: &Ctx) -> Res<Option<wtf::Snapshot>> {
     let dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
-    tauri::async_runtime::spawn_blocking(move || wtf::snapshot(&dir, "manual"))
+    tokio::task::spawn_blocking(move || wtf::snapshot(&dir, "manual"))
         .await
         .map_err(|e| e.to_string())?
         .map_err(err)
 }
 
-#[tauri::command]
-async fn restore_settings(ctx: tauri::State<'_, Ctx>, file: String) -> Res<()> {
+async fn restore_settings(ctx: &Ctx, file: String) -> Res<()> {
     let dir = PathBuf::from(&ctx.state.lock().await.addons_dir);
-    tauri::async_runtime::spawn_blocking(move || wtf::restore(&dir, Path::new(&file)))
+    tokio::task::spawn_blocking(move || wtf::restore(&dir, Path::new(&file)))
         .await
         .map_err(|e| e.to_string())?
         .map_err(err)
 }
 
-#[tauri::command]
-async fn set_pinned(ctx: tauri::State<'_, Ctx>, id: String, pinned: bool) -> Res<TrackedAddon> {
+async fn set_pinned(ctx: &Ctx, id: String, pinned: bool) -> Res<TrackedAddon> {
     let mut st = ctx.state.lock().await;
     let a = st.addons.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("{id} isn't tracked"))?;
     a.pinned = pinned;
@@ -916,8 +894,7 @@ struct AddonList {
 }
 
 /// Write the tracked addons to <Downloads>/hearth-addons.json. Returns the file path.
-#[tauri::command]
-async fn export_list(ctx: tauri::State<'_, Ctx>) -> Res<String> {
+async fn export_list(ctx: &Ctx) -> Res<String> {
     let st = ctx.state.lock().await;
     if st.downloads_dir.is_empty() {
         return Err("Set a Downloads folder in Settings first".into());
@@ -946,8 +923,7 @@ async fn export_list(ctx: tauri::State<'_, Ctx>) -> Res<String> {
 }
 
 /// Entries of <Downloads>/hearth-addons.json that aren't tracked here yet.
-#[tauri::command]
-async fn import_list(ctx: tauri::State<'_, Ctx>) -> Res<Vec<ListEntry>> {
+async fn import_list(ctx: &Ctx) -> Res<Vec<ListEntry>> {
     let st = ctx.state.lock().await;
     let path = Path::new(&st.downloads_dir).join(LIST_FILE);
     let bytes = std::fs::read(&path).map_err(|_| format!("Put {LIST_FILE} (from Export on your other PC) in {} first", st.downloads_dir))?;
@@ -960,8 +936,7 @@ async fn import_list(ctx: tauri::State<'_, Ctx>) -> Res<Vec<ListEntry>> {
 }
 
 /// Release notes for the version an update would install.
-#[tauri::command]
-async fn changelog(ctx: tauri::State<'_, Ctx>, id: String) -> Res<String> {
+async fn changelog(ctx: &Ctx, id: String) -> Res<String> {
     let (a, addons_dir, token) = {
         let st = ctx.state.lock().await;
         let a = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
@@ -981,14 +956,12 @@ async fn changelog(ctx: tauri::State<'_, Ctx>, id: String) -> Res<String> {
 }
 
 /// Is WoW running? null when it can't be checked.
-#[tauri::command]
 async fn wow_running() -> Res<Option<bool>> {
-    tauri::async_runtime::spawn_blocking(game::wow_running).await.map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(game::wow_running).await.map_err(|e| e.to_string())
 }
 
 /// For each tracked addon with a backup: the version it would roll back to ("" if unknown).
-#[tauri::command]
-async fn rollback_options(ctx: tauri::State<'_, Ctx>) -> Res<std::collections::HashMap<String, String>> {
+async fn rollback_options(ctx: &Ctx) -> Res<std::collections::HashMap<String, String>> {
     let st = ctx.state.lock().await;
     Ok(st
         .addons
@@ -998,8 +971,7 @@ async fn rollback_options(ctx: tauri::State<'_, Ctx>) -> Res<std::collections::H
 }
 
 /// Swap an addon back to its backed-up version (and keep the current one as the new backup).
-#[tauri::command]
-async fn roll_back(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> {
+async fn roll_back(ctx: &Ctx, id: String) -> Res<TrackedAddon> {
     let mut st = ctx.state.lock().await;
     let addons_dir = PathBuf::from(&st.addons_dir);
     let cur = st.addons.iter().find(|a| a.id == id).cloned().ok_or_else(|| format!("{id} isn't tracked"))?;
@@ -1020,7 +992,6 @@ async fn roll_back(ctx: tauri::State<'_, Ctx>, id: String) -> Res<TrackedAddon> 
 }
 
 /// Open a web page in the user's normal (Windows) browser. Only for the addon sites Hearth links to.
-#[tauri::command]
 fn open_url(url: String) -> Res<()> {
     const ALLOWED: [&str; 4] = [
         "https://www.curseforge.com/",
@@ -1058,7 +1029,6 @@ struct BuildInfo {
     built_at: u64,
 }
 
-#[tauri::command]
 fn build_info() -> BuildInfo {
     BuildInfo {
         version: env!("CARGO_PKG_VERSION"),
@@ -1068,13 +1038,64 @@ fn build_info() -> BuildInfo {
     }
 }
 
-#[tauri::command]
 fn backup_location() -> String {
     state::data_dir().join("backup").to_string_lossy().into_owned()
 }
 
-/// One Hearth at a time: a second launch (e.g. the desktop shortcut while the startup copy runs)
-/// asks the first to show its window, then exits. Uses a Unix socket in the app data folder.
+
+// ---- The UI calls these as POST /api/<name> with JSON arguments (see server.rs).
+
+fn arg<T: serde::de::DeserializeOwned>(args: &serde_json::Value, name: &str) -> Res<T> {
+    serde_json::from_value(args.get(name).cloned().unwrap_or_default()).map_err(|e| format!("Bad argument {name}: {e}"))
+}
+
+fn out<T: Serialize>(r: Res<T>) -> Res<serde_json::Value> {
+    r.and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+}
+
+async fn call(ctx: &Ctx, ev: &Events, cmd: &str, a: &serde_json::Value) -> Res<serde_json::Value> {
+    match cmd {
+        "get_state" => out(get_state(ctx).await),
+        "save_settings" => out(
+            save_settings(ctx, arg(a, "addonsDir")?, arg(a, "downloadsDir")?, arg(a, "gameInterface")?, arg(a, "githubToken")?).await,
+        ),
+        "scan" => out(scan(ctx).await),
+        "scan_downloads" => out(scan_downloads(ctx).await),
+        "downloads_signature" => out(downloads_signature(ctx).await),
+        "recycle_zips" => out(recycle_zips(ctx, arg(a, "paths")?).await),
+        "adoptable_addons" => out(adoptable_addons(ctx).await),
+        "adopt" => out(adopt(ctx, arg(a, "folders")?).await),
+        "missing_dependencies" => out(missing_dependencies(ctx).await),
+        "install" => out(install(ev, ctx, arg(a, "url")?, arg(a, "assetPattern")?, arg(a, "job")?).await),
+        "install_local" => out(install_local(ev, ctx, arg(a, "path")?, arg(a, "job")?).await),
+        "link_addon" => out(link_addon(ev, ctx, arg(a, "id")?, arg(a, "source")?, arg(a, "job")?).await),
+        "update_addon" => out(update_addon(ev, ctx, arg(a, "id")?, arg(a, "job")?).await),
+        "check_updates" => out(check_updates(ctx).await),
+        "review_update" => out(review_update(ev, ctx, arg(a, "id")?, arg(a, "job")?).await),
+        "review_local" => out(review_local(ev, ctx, arg(a, "path")?, arg(a, "job")?).await),
+        "review_file" => out(review_file(ctx, arg(a, "token")?, arg(a, "path")?).await),
+        "apply_review" => out(apply_review(ev, ctx, arg(a, "token")?, arg(a, "allowPrograms")?, arg(a, "job")?).await),
+        "discard_review" => out(Ok(discard_review(ctx, arg(a, "token")?))),
+        "uninstall" => out(uninstall(ctx, arg(a, "id")?).await),
+        "rollback_options" => out(rollback_options(ctx).await),
+        "roll_back" => out(roll_back(ctx, arg(a, "id")?).await),
+        "set_pinned" => out(set_pinned(ctx, arg(a, "id")?, arg(a, "pinned")?).await),
+        "wow_running" => out(wow_running().await),
+        "export_list" => out(export_list(ctx).await),
+        "import_list" => out(import_list(ctx).await),
+        "changelog" => out(changelog(ctx, arg(a, "id")?).await),
+        "settings_backups" => out(settings_backups(ctx).await),
+        "backup_settings_now" => out(backup_settings_now(ctx).await),
+        "restore_settings" => out(restore_settings(ctx, arg(a, "file")?).await),
+        "open_url" => out(open_url(arg(a, "url")?)),
+        "build_info" => out(Ok(build_info())),
+        "backup_location" => out(Ok(backup_location())),
+        _ => Err(format!("Unknown command {cmd}")),
+    }
+}
+
+/// One Hearth at a time: a second launch asks the running one to open a window, then exits.
+/// Uses a Unix socket in the app data folder.
 #[cfg(unix)]
 mod single {
     use std::io::{Read, Write};
@@ -1085,7 +1106,7 @@ mod single {
         crate::state::data_dir().join("hearth.sock")
     }
 
-    /// True if another Hearth answered (and was asked to show itself).
+    /// True if another Hearth answered (and was asked to open a window).
     pub fn signal_existing() -> bool {
         match UnixStream::connect(sock()) {
             Ok(mut s) => s.write_all(b"show").is_ok(),
@@ -1107,83 +1128,63 @@ mod single {
             });
         }
     }
+
+    pub fn stop() {
+        let _ = std::fs::remove_file(sock());
+    }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    // The old "start with Windows" shortcut ran `hearth --hidden`. Nothing needs to run in the
+    // background any more (updates are checked when the window opens), so it does nothing.
+    if std::env::args().any(|a| a == "--hidden" || a == "--minimized") {
+        return;
+    }
     #[cfg(unix)]
     if single::signal_existing() {
         return;
     }
+    let port = std::env::var("HEARTH_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(server::DEFAULT_PORT);
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Probably another Hearth starting at the same moment: give it a second, then ask it.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            #[cfg(unix)]
+            if single::signal_existing() {
+                return;
+            }
+            eprintln!("hearth: can't listen on 127.0.0.1:{port}: {e}. Set HEARTH_PORT to use another port.");
+            std::process::exit(1);
+        }
+    };
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("hearth-addon-manager/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("http client");
-
-    tauri::Builder::default()
-        .setup(|app| {
-            use tauri::Manager;
-            // Started at Windows login: run in the background (updates are still checked).
-            // Hidden, not minimized: under WSLg (Wayland) an app can't un-minimize itself,
-            // but it can show a hidden window.
-            if std::env::args().any(|a| a == "--minimized" || a == "--hidden") {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.hide();
-                }
-            }
-            #[cfg(unix)]
-            {
-                let handle = app.handle().clone();
-                single::listen(move || {
-                    if let Some(w) = handle.get_webview_window("main") {
-                        // Re-mapping the window brings it back even if the user minimized it.
-                        if w.is_visible().unwrap_or(false) {
-                            let _ = w.hide();
-                        }
-                        let _ = w.show();
-                        let _ = w.unminimize();
-                        let _ = w.set_focus();
-                    }
-                });
-            }
-            Ok(())
+    let ctx = std::sync::Arc::new(Ctx { state: Mutex::new(AppState::load()), client, reviews: Default::default() });
+    let (events, _) = tokio::sync::broadcast::channel(256);
+    let handler: server::Handler = {
+        let (ctx, events) = (ctx.clone(), events.clone());
+        std::sync::Arc::new(move |cmd, args| {
+            let (ctx, ev) = (ctx.clone(), events.clone());
+            Box::pin(async move { call(&ctx, &ev, &cmd, &args).await })
         })
-        .manage(Ctx { state: Mutex::new(AppState::load()), client, reviews: Default::default() })
-        .invoke_handler(tauri::generate_handler![
-            get_state,
-            review_update,
-            review_local,
-            review_file,
-            apply_review,
-            discard_review,
-            save_settings,
-            scan,
-            scan_downloads,
-            downloads_signature,
-            recycle_zips,
-            adoptable_addons,
-            adopt,
-            missing_dependencies,
-            install_local,
-            install,
-            link_addon,
-            check_updates,
-            update_addon,
-            uninstall,
-            rollback_options,
-            roll_back,
-            wow_running,
-            set_pinned,
-            export_list,
-            import_list,
-            changelog,
-            settings_backups,
-            backup_settings_now,
-            restore_settings,
-            open_url,
-            build_info,
-            backup_location
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running Hearth");
+    };
+    let server = server::Server::new(port, events, handler);
+    #[cfg(unix)]
+    {
+        let s = server.clone();
+        single::listen(move || s.open_window());
+    }
+    server.open_window();
+    if let Err(e) = server.run(listener).await {
+        eprintln!("hearth: {e}");
+    }
+    #[cfg(unix)]
+    single::stop();
+    // Delete the folders of updates unpacked for Show diff and never installed.
+    ctx.reviews.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

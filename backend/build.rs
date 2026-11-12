@@ -26,5 +26,4 @@ fn main() {
     for p in ["../.git/HEAD", "../.git/index", "../.git/refs/heads", "src", "../ui", "Cargo.toml"] {
         println!("cargo:rerun-if-changed={p}");
     }
-    tauri_build::build()
 }

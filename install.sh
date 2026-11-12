@@ -5,34 +5,17 @@
 set -euo pipefail
 . "$HOME/.cargo/env"
 here="$(dirname "$(readlink -f "$0")")"
-cd "$here/src-tauri"
+cd "$here/backend"
 export CARGO_TARGET_DIR="$HOME/hearth-target"
 cargo build --release
 
-install -Dm755 "$CARGO_TARGET_DIR/release/hearth" /usr/local/lib/hearth/hearth
+install -Dm755 "$CARGO_TARGET_DIR/release/hearth" /usr/local/bin/hearth
 install -Dm644 icons/icon.png /usr/share/icons/hicolor/256x256/apps/hearth.png
-
-# Launcher with the env WebKitGTK needs under WSLg.
-cat > /usr/local/bin/hearth <<'EOF'
-#!/usr/bin/env bash
-# With WSL's GPU (/dev/dxg), draw on it through Mesa's d3d12 driver: smooth scrolling.
-# Without it, WebKit's GPU renderer can show a blank window, so let it draw on the CPU.
-if [ -e /dev/dxg ]; then
-  export GALLIUM_DRIVER=d3d12
-else
-  export WEBKIT_DISABLE_DMABUF_RENDERER=1
-fi
-# Under WSLg, run on X11 so WSLg draws the window frame: on Wayland, GTK's own frame has
-# resize edges that are hard to grab.
-if [ -d /mnt/wslg ]; then
-  export GDK_BACKEND=x11
-fi
-exec /usr/local/lib/hearth/hearth "$@"
-EOF
-chmod 755 /usr/local/bin/hearth
+# Left over from the WebKitGTK version, which needed a launcher script.
+rm -rf /usr/local/lib/hearth
 
 # WSLg turns .desktop files into Windows Start menu entries.
-cat > /usr/share/applications/hearth.desktop <<'EOF'
+cat > /usr/share/applications/hearth.desktop <<'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Hearth
@@ -40,6 +23,6 @@ Comment=WoW addon manager
 Exec=/usr/local/bin/hearth
 Icon=hearth
 Categories=Game;Utility;
-EOF
+DESKTOP
 
 echo "Installed: /usr/local/bin/hearth"
